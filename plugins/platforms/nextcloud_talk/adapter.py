@@ -252,6 +252,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop the webhook HTTP server."""
+        self._running = False
         self._mark_disconnected()
         if self._runner:
             await self._runner.cleanup()
@@ -264,17 +265,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     async def handle_message(self, event: MessageEvent) -> None:
         """Process a received message event."""
-        if not self._message_handler:
-            return
-
-        session_key = self._get_session_key(event)
-        self._active_sessions.setdefault(
-            session_key, asyncio.Event()
-        ).set()
-
-        task = asyncio.create_task(self._process_message(event, session_key))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        # Delegate to base class for proper gateway routing
+        await super().handle_message(event)
 
     async def _process_message(
         self, event: MessageEvent, session_key: str
@@ -325,10 +317,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             ):
                 # ── Rate limiting on signature failure (Improvement 1) ────
                 client_ip = request.remote  # aiohttp: remote is already a string (IP)
-                self._record_failed_attempt(client_ip)
-                if self._is_rate_limited(client_ip):
-                    logger.warning("Rate limited: %s", client_ip)
-                    return _json_response(429, {"error": "Too many failed attempts"})
+                # Only record if not already blocked
+                if not self._is_rate_limited(client_ip):
+                    self._record_failed_attempt(client_ip)
+                    if self._is_rate_limited(client_ip):
+                        logger.warning("Rate limited: %s", client_ip)
+                        return _json_response(429, {"error": "Too many failed attempts"})
                 # Reset failed attempts on successful auth (unblock)
                 self._clear_failed_attempts(client_ip)
 
@@ -457,7 +451,13 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         sender_name = str(actor.get("name", ""))
 
         target = data.get("target", {})
-        room_token = str(target.get("name", ""))
+        # Extract room token from target.id (e.g., "https://nc.example.com/index.php/call/abc123")
+        target_id = str(target.get("id", ""))
+        # Extract room token from URL path if available
+        if target_id and "call/" in target_id:
+            room_token = target_id.split("call/")[-1].split("?")[0]
+        else:
+            room_token = target_id
 
         message_id = str(obj.get("id", ""))
         is_group = data.get("isGroupChat", False)
