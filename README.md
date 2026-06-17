@@ -1,27 +1,27 @@
 # Nextcloud Talk Platform Plugin for Hermes Agent
 
-Hermes Agent용 Nextcloud Talk webhook 플랫폼 플러그인. OpenClaw의 nextcloud-talk extension 패턴을 참고하여 구현.
+A Hermes Agent platform plugin that connects Nextcloud Talk via webhook. Based on the OpenClaw nextcloud-talk extension pattern.
 
-## 기능
+## Features
 
-- HTTP POST webhook으로 Nextcloud Talk 메시지 수신
-- HMAC-SHA256 서명 검증 (Timing attack 방지)
-- ActivityPub 스타일 페이로드 파싱 (Create/Update/Delete 지원)
-- Bot API를 통한 메시지 발송 (reply-to 지원)
-- 메시지 중복 방지 (5분 TTL)
-- `/healthz` 헬스체크 엔드포인트
-- Cron jobs용 standalone sender
-- **DDoS 방어: IP 기반 Rate Limiting** (5분 내 10회 실패 시 30분 차단)
-- **Room별 권한 정책**: 그룹 채팅 멤버 제한, DM 허용 사용자 제한
-- **설정 검증**: 포트 범위, URL 형식 자동 검증
+- Receive Nextcloud Talk messages via HTTP POST webhook
+- HMAC-SHA256 signature verification (timing attack resistant)
+- ActivityPub-style payload parsing (Create/Update/Delete)
+- Send messages via Bot API (reply-to support)
+- Message deduplication (5 min TTL)
+- `/healthz` health check endpoint
+- Standalone sender for cron jobs
+- **DDoS protection: IP-based Rate Limiting** (30 min block after 10 failures in 5 min)
+- **Room-level permission policies**: group member restriction, DM allow-list
+- **Config validation**: automatic port range and URL format validation
 
-## 설치
+## Installation
 
 ```bash
 pip install aiohttp httpx
 ```
 
-Hermes Agent의 `plugins/platforms/` 디렉토리에 배치:
+Place in Hermes Agent's `plugins/platforms/` directory:
 
 ```
 ~/.hermes/hermes-agent/plugins/platforms/nextcloud_talk/
@@ -30,7 +30,7 @@ Hermes Agent의 `plugins/platforms/` 디렉토리에 배치:
 └── adapter.py
 ```
 
-## 설정 (config.yaml)
+## Configuration (config.yaml)
 
 ```yaml
 gateway:
@@ -47,11 +47,11 @@ gateway:
         # ── Optional: Permission policies ──
         # group_policy: "all"        # "all" | "members" | "mentioned"
         # dm_policy: "all"           # "all" | "restricted"
-        # allowed_users: ["user1", "user2"]  # Comma-separated or list
+        # allowed_users: ["user1", "user2"]
         # allowed_dm_users: ["user1"]
 ```
 
-또는 환경변수 (config.yaml 우선):
+Or via environment variables (config.yaml takes precedence):
 
 ```bash
 export NEXTCLOUD_TALK_BASE_URL=https://your-nextcloud.example.com
@@ -66,61 +66,65 @@ export NEXTCLOUD_TALK_DM_POLICY=restricted     # "all" | "restricted"
 export NEXTCLOUD_TALK_ALLOWED_DM_USERS=user1,user2
 ```
 
-### 권한 정책 설명
+### Permission Policies
 
-| 설정 | 옵션 | 설명 |
-|------|------|------|
-| `group_policy` | `all` (기본) | 그룹 채팅의 모든 메시지 허용 |
-| | `members` | `allowed_users`에 있는 사용자만 허용 |
-| | `mentioned` | 봇이 멘션된 메시지만 허용 (향후 지원) |
-| `dm_policy` | `all` (기본) | 모든 DM 허용 |
-| | `restricted` | `allowed_dm_users`에 있는 사용자만 허용 |
+| Setting | Options | Description |
+|---------|---------|-------------|
+| `group_policy` | `all` (default) | Allow all messages in group chats |
+| | `members` | Only allow users in `allowed_users` |
+| | `mentioned` | Only allow messages mentioning the bot (future) |
+| `dm_policy` | `all` (default) | Allow all DMs |
+| | `restricted` | Only allow users in `allowed_dm_users` |
 
-## Nextcloud Talk Webhook 설정
+## Nextcloud Talk Webhook Setup
 
-1. Nextcloud Talk 대시보드에서 Bot 설정
-2. Webhook URL: `http://<서버IP>:8745/nextcloud-talk/callback`
-3. Bot Access Token 및 HMAC Secret 발급
+1. Open Nextcloud Talk dashboard
+2. Go to **Settings → Bot**
+3. Click **Create Bot**
+4. Set bot name (e.g., "Hermes Agent")
+5. Copy **Access Token** and **HMAC Secret** — needed for configuration
 
-## API 엔드포인트
+## API Endpoints
 
-| Method | Path | 설명 |
-|--------|------|------|
-| POST | `/nextcloud-talk/callback` | 메시지 webhook |
-| GET | `/healthz` | 헬스체크 |
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/nextcloud-talk/callback` | Message webhook |
+| GET | `/healthz` | Health check |
 
-## 응답 코드
+## Response Codes
 
-| 코드 | 설명 |
-|------|------|
-| 200 | 메시지 수신/수락됨 |
-| 400 | 잘못된 요청 (헤더 누락, JSON 오류) |
-| 403 | 서명 검증 실패 |
-| 429 | Rate limit 초과 (10회 이상 실패) |
-| 500 | 내부 서버 오류 |
+| Code | Description |
+|------|-------------|
+| 200 | Message received/accepted |
+| 400 | Bad request (missing headers, JSON error) |
+| 403 | Signature verification failed |
+| 429 | Rate limit exceeded (10+ failures) |
+| 500 | Internal server error |
 
-## 아키텍처
+## Architecture
 
 ```
 Nextcloud Talk ──POST──> [Hermes Plugin] ──> [Agent Processing] ──> Response
                             │
-                            ├─ HMAC-SHA256 검증
-                            ├─ Rate Limiting (IP 기반)
-                            ├─ ActivityPub 파싱 (Create/Update/Delete)
+                            ├─ HMAC-SHA256 verification
+                            ├─ Rate Limiting (IP-based)
+                            ├─ ActivityPub parsing (Create/Update/Delete)
                             ├─ Dedup (5min TTL)
-                            ├─ 권한 정책 체크 (group/dm)
-                            └─ Bot API 발송 (reply-to 지원)
+                            ├─ Permission policy check (group/dm)
+                            └─ Bot API send (reply-to support)
 ```
 
-## 테스트
+## Testing
 
 ```bash
 pip install pytest pytest-asyncio
 pytest tests/ -v
 ```
 
-자세한 테스트 가이드는 [MANUAL_TEST_GUIDE.md](MANUAL_TEST_GUIDE.md) 참조.
+See [MANUAL_TEST_GUIDE.md](MANUAL_TEST_GUIDE.md) for detailed test instructions.
 
-## 라이선스
+See [README_ko.md](README_ko.md) for Korean documentation.
+
+## License
 
 MIT
