@@ -24,7 +24,7 @@ pip install aiohttp httpx
 Place in Hermes Agent's `plugins/platforms/` directory:
 
 ```
-~/.hermes/hermes-agent/plugins/platforms/nextcloud_talk/
+~/.hermes/plugins/platforms/nextcloud_talk/
 ├── plugin.yaml
 ├── __init__.py
 └── adapter.py
@@ -71,10 +71,10 @@ export NEXTCLOUD_TALK_ALLOWED_DM_USERS=user1,user2
 | Setting | Options | Description |
 |---------|---------|-------------|
 | `group_policy` | `all` (default) | Allow all messages in group chats |
-| | `members` | Only allow users in `allowed_users` |
+| | `members` | Only allow users in `allowed_users` (empty list = deny all) |
 | | `mentioned` | Only allow messages mentioning the bot (future) |
 | `dm_policy` | `all` (default) | Allow all DMs |
-| | `restricted` | Only allow users in `allowed_dm_users` |
+| | `restricted` | Only allow users in `allowed_dm_users` (empty list = deny all) |
 
 ## Nextcloud Talk Webhook Setup
 

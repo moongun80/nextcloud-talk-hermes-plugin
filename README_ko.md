@@ -24,7 +24,7 @@ pip install aiohttp httpx
 Hermes Agent 의 `plugins/platforms/` 디렉토리에 배치:
 
 ```
-~/.hermes/hermes-agent/plugins/platforms/nextcloud_talk/
+~/.hermes/plugins/platforms/nextcloud_talk/
 ├── plugin.yaml
 ├── __init__.py
 └── adapter.py
@@ -71,10 +71,10 @@ export NEXTCLOUD_TALK_ALLOWED_DM_USERS=user1,user2
 | 설정 | 옵션 | 설명 |
 |------|------|------|
 | `group_policy` | `all` (기본) | 그룹 채팅의 모든 메시지 허용 |
-| | `members` | `allowed_users` 에 있는 사용자만 허용 |
+| | `members` | `allowed_users` 에 있는 사용자만 허용 (빈 목록 = 전체 차단) |
 | | `mentioned` | 봇이 멘션된 메시지만 허용 (향후 지원) |
 | `dm_policy` | `all` (기본) | 모든 DM 허용 |
-| | `restricted` | `allowed_dm_users` 에 있는 사용자만 허용 |
+| | `restricted` | `allowed_dm_users` 에 있는 사용자만 허용 (빈 목록 = 전체 차단) |
 
 ## Nextcloud Talk Webhook 설정
 

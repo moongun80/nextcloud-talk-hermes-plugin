@@ -550,12 +550,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         chat_type = getattr(source, "chat_type", "unknown")
 
         if chat_type == "group" and self._group_policy == "members":
-            if self._allowed_users and sender_id not in self._allowed_users:
+            if sender_id not in self._allowed_users:
                 logger.info("Permission denied: user %s not in allowed_users for group chat", sender_id)
                 return False
 
         if chat_type == "dm" and self._dm_policy == "restricted":
-            if self._allowed_dm_users and sender_id not in self._allowed_dm_users:
+            if sender_id not in self._allowed_dm_users:
                 logger.info("Permission denied: user %s not in allowed_dm_users for DM", sender_id)
                 return False
 
