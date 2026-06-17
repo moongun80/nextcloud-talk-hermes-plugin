@@ -1,11 +1,11 @@
 """Nextcloud Talk webhook adapter for Hermes Agent.
 
-Handles Nextcloud Talk bot webhooks: receives chat messages via HTTP POST,
+Receives chat messages via HTTP POST webhook (ActivityPub-style payloads),
 verifies HMAC-SHA256 signatures, and sends responses back via the Talk
 Bot API.
 
-Based on the OpenClaw nextcloud-talk extension and Hermes' wecom_callback.py
-pattern.
+Thin protocol bridge — session management, message routing, and background
+task lifecycle are handled by BasePlatformAdapter.
 
 Configuration in config.yaml::
 
@@ -31,7 +31,6 @@ Or via environment variables (overrides config.yaml)::
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import json
@@ -119,9 +118,9 @@ def is_connected(config) -> bool:
 class NextcloudTalkAdapter(BasePlatformAdapter):
     """Nextcloud Talk webhook adapter.
 
-    Receives messages via HTTP POST webhook (ActivityPub-style payloads),
-    verifies HMAC-SHA256 signatures, and sends responses via the Nextcloud
-    Talk Bot API.
+    Thin protocol bridge: receives webhooks, verifies signatures, parses
+    ActivityPub payloads into MessageEvents, and delegates to the gateway
+    for session management and routing.
     """
 
     supports_code_blocks: bool = True
@@ -152,11 +151,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         )
 
         # ── Rate limiting ───────────────────────────────────────────────
-        # Maps IP -> list of failure timestamps (monotonic)
         self._failed_attempts: Dict[str, List[float]] = {}
-
-        # Maps IP -> block expiry timestamp (monotonic). Separate from
-        # _failed_attempts so the 30-min block survives window expiry.
         self._blocked_ips: Dict[str, float] = {}
 
         # ── Room-based permission policies ──────────────────────────────
@@ -201,7 +196,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._app: Optional[web.Application] = None
         self._http_client: Optional[httpx.AsyncClient] = None
         self._seen_messages: Dict[str, float] = {}
-        self._running = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -217,7 +211,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             )
             return False
 
-        # ── Config validation (Improvement 3) ───────────────────────────
         if not self._validate_port(self._port):
             logger.error("Invalid port: %d (must be 1-65535)", self._port)
             return False
@@ -278,30 +271,19 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             random_val = headers.get(RANDOM_HEADER, "")
 
             if not signature or not random_val:
-                logger.warning(
-                    "Missing signature or random header from Nextcloud"
-                )
-                return _json_response(
-                    400, {"error": "Missing signature/random headers"}
-                )
+                logger.warning("Missing signature or random header from Nextcloud")
+                return _json_response(400, {"error": "Missing signature/random headers"})
 
-            if not self._verify_signature(
-                random_val, body, self._bot_secret, signature
-            ):
-                # ── Rate limiting on signature failure (Improvement 1) ────
-                client_ip = request.remote  # aiohttp: remote is already a string (IP)
+            client_ip = request.remote
+
+            if not self._verify_signature(random_val, body, self._bot_secret, signature):
                 self._record_failed_attempt(client_ip)
                 if self._is_rate_limited(client_ip):
                     logger.warning("Rate limited: %s", client_ip)
                     return _json_response(429, {"error": "Too many failed attempts"})
-
                 logger.warning("Invalid signature from Nextcloud Talk")
-                return _json_response(
-                    403, {"error": "Invalid signature"}
-                )
+                return _json_response(403, {"error": "Invalid signature"})
 
-            # Successful auth — clear rate-limit tracking for this IP
-            client_ip = request.remote
             self._clear_failed_attempts(client_ip)
 
             data = json.loads(body)
@@ -309,17 +291,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             if not msg_event:
                 return _json_response(200, {"status": "ok"})
 
-            # ── Permission check (Improvement 2) ──────────────────────
             if not self._check_permissions(msg_event):
                 return _json_response(200, {"status": "permission_denied"})
 
-            # Dedup
             msg_id = msg_event.message_id
             if msg_id and self._is_duplicate(msg_id):
                 logger.debug("Skipping duplicate message %s", msg_id)
                 return _json_response(200, {"status": "duplicate"})
 
-            # Queue for gateway processing
+            # Delegate to base class for gateway routing
             await self.handle_message(msg_event)
             return _json_response(200, {"status": "accepted"})
 
@@ -360,7 +340,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         now = time.monotonic()
 
-        # Bulk-evict expired entries
         expired = [
             k for k, ts in self._seen_messages.items()
             if now - ts > MESSAGE_DEDUP_TTL_SECONDS
@@ -381,7 +360,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         Expected structure:
         {
-          "type": "Create",                  # Create | Update | Delete
+          "type": "Create",
           "actor": {"type": "Person", "id": "...", "name": "..."},
           "object": {
             "type": "Note", "id": "...",
@@ -393,20 +372,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         """
         activity_type = data.get("type", "")
 
-        # Handle Update and Delete gracefully
-        if activity_type == "Delete":
-            logger.debug("Ignoring Delete activity")
+        if activity_type in ("Delete", "Update"):
+            logger.debug("Ignoring %s activity", activity_type)
             return None
 
-        if activity_type == "Update":
-            logger.debug("Ignoring Update activity")
-            return None
-
-        # Only process "Create" activities (new messages)
         if activity_type != "Create":
-            logger.debug(
-                "Ignoring non-Create activity type: %s", activity_type
-            )
+            logger.debug("Ignoring non-Create activity type: %s", activity_type)
             return None
 
         obj = data.get("object", {})
@@ -420,10 +391,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         sender_name = str(actor.get("name", ""))
 
         target = data.get("target", {})
-        # Extract room token from target.id (e.g., "https://nc.example.com/index.php/call/abc123")
         target_id = str(target.get("id", ""))
-        # Extract room token from URL path if available
-        if target_id and "call/" in target_id:
+        # Extract room token from URL path (e.g. ".../call/abc123")
+        if "call/" in target_id:
             room_token = target_id.split("call/")[-1].split("?")[0]
         else:
             room_token = target_id
@@ -431,7 +401,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         message_id = str(obj.get("id", ""))
         is_group = data.get("isGroupChat", False)
 
-        # Build SessionSource for gateway routing
         source = SessionSource(
             platform=Platform("nextcloud_talk"),
             chat_id=room_token,
@@ -465,22 +434,16 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         room_token = chat_id
         if not room_token:
-            return SendResult(
-                success=False, error="No room_token in chat_id"
-            )
+            return SendResult(success=False, error="No room_token in chat_id")
 
-        url = (
-            f"/ocs/v2.php/apps/spreed/api/v1/bot/{room_token}/message"
-        )
+        url = f"/ocs/v2.php/apps/spreed/api/v1/bot/{room_token}/message"
 
         payload: Dict[str, Any] = {"message": content}
         if reply_to:
             payload["replyTo"] = reply_to
 
-        # Serialize payload for both sending and signing
         payload_body = json.dumps(payload)
 
-        # Generate HMAC signature over random + JSON body (matching Nextcloud Bot API spec)
         random_value = secrets.token_hex(16)
         signing_input = random_value + payload_body
         signature = hmac.new(
@@ -489,43 +452,28 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             hashlib.sha256,
         ).hexdigest()
 
-        headers = {
-            RANDOM_HEADER: random_value,
-            SIGNATURE_HEADER: signature,
-        }
-
         try:
             resp = await self._http_client.post(
                 url,
                 content=payload_body.encode("utf-8"),
                 headers={
                     "Content-Type": "application/json",
-                    **headers,
+                    RANDOM_HEADER: random_value,
+                    SIGNATURE_HEADER: signature,
                 },
             )
             if resp.status_code in (200, 201):
-                logger.debug(
-                    "Sent message to room %s (reply_to=%s)",
-                    room_token, reply_to,
-                )
+                logger.debug("Sent message to room %s (reply_to=%s)", room_token, reply_to)
                 return SendResult(success=True)
-            else:
-                logger.error(
-                    "Nextcloud Talk send failed: %d %s",
-                    resp.status_code, resp.text[:200],
-                )
-                return SendResult(
-                    success=False, error=f"HTTP {resp.status_code}"
-                )
+            logger.error("Nextcloud Talk send failed: %d %s", resp.status_code, resp.text[:200])
+            return SendResult(success=False, error=f"HTTP {resp.status_code}")
         except Exception as exc:
             logger.error("Nextcloud Talk send error: %s", exc)
             return SendResult(success=False, error=str(exc))
 
     # ── Optional overrides ────────────────────────────────────────────────
 
-    async def send_typing(
-        self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
-    ) -> None:
+    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Nextcloud Talk has no typing indicator."""
         pass
 
@@ -543,7 +491,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         """Health check endpoint — OpenClaw-compatible /healthz."""
         return _json_response(200, {"status": "healthy"})
 
-    # ── Improvement 1: Rate Limiting ──────────────────────────────────────
+    # ── Rate limiting ─────────────────────────────────────────────────────
 
     def _record_failed_attempt(self, ip: str) -> None:
         """Record a failed authentication attempt for the given IP."""
@@ -564,13 +512,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         if block_expiry is not None:
             if now < block_expiry:
                 return True
-            # Block expired — clear it
             del self._blocked_ips[ip]
             self._failed_attempts.pop(ip, None)
             return False
 
         attempts = self._failed_attempts.get(ip, [])
-
         if not attempts:
             return False
 
@@ -579,7 +525,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._failed_attempts[ip] = recent
 
         if len(recent) >= RATE_LIMIT_MAX_ATTEMPTS:
-            # Block for RATE_LIMIT_BLOCK_SECONDS
             self._blocked_ips[ip] = now + RATE_LIMIT_BLOCK_SECONDS
             return True
 
@@ -590,7 +535,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._failed_attempts.pop(ip, None)
         self._blocked_ips.pop(ip, None)
 
-    # ── Improvement 2: Permission Policies ────────────────────────────────
+    # ── Permission policies ───────────────────────────────────────────────
 
     def _check_permissions(self, event: MessageEvent) -> bool:
         """Check if the sender is authorized to send messages.
@@ -604,27 +549,19 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         sender_id = getattr(source, "user_id", "")
         chat_type = getattr(source, "chat_type", "unknown")
 
-        # Group policy check
         if chat_type == "group" and self._group_policy == "members":
             if self._allowed_users and sender_id not in self._allowed_users:
-                logger.info(
-                    "Permission denied: user %s not in allowed_users for group chat",
-                    sender_id,
-                )
+                logger.info("Permission denied: user %s not in allowed_users for group chat", sender_id)
                 return False
 
-        # DM policy check
         if chat_type == "dm" and self._dm_policy == "restricted":
             if self._allowed_dm_users and sender_id not in self._allowed_dm_users:
-                logger.info(
-                    "Permission denied: user %s not in allowed_dm_users for DM",
-                    sender_id,
-                )
+                logger.info("Permission denied: user %s not in allowed_dm_users for DM", sender_id)
                 return False
 
         return True
 
-    # ── Improvement 3: Config Validation ──────────────────────────────────
+    # ── Config validation ─────────────────────────────────────────────────
 
     @staticmethod
     def _validate_port(port: int) -> bool:
@@ -634,9 +571,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     @staticmethod
     def _validate_base_url(url: str) -> bool:
         """Validate that the base URL starts with http:// or https://."""
-        return isinstance(url, str) and (
-            url.startswith("http://") or url.startswith("https://")
-        )
+        return isinstance(url, str) and (url.startswith("http://") or url.startswith("https://"))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -686,10 +621,8 @@ async def _standalone_send(
         f"{room_token}/message"
     )
 
-    # Build payload and serialize for both sending and signing
     payload_body = json.dumps({"message": message})
 
-    # Generate HMAC signature over random + JSON body
     random_value = secrets.token_hex(16)
     signing_input = random_value + payload_body
     signature = hmac.new(
@@ -712,13 +645,8 @@ async def _standalone_send(
                 },
             )
             if resp.status_code in (200, 201):
-                return {
-                    "success": True,
-                    "message_id": str(int(time.time() * 1000)),
-                }
-            return {
-                "error": f"HTTP {resp.status_code}: {resp.text[:200]}"
-            }
+                return {"success": True, "message_id": str(int(time.time() * 1000))}
+            return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -749,14 +677,10 @@ def register(ctx) -> None:
             "NEXTCLOUD_TALK_BOT_SECRET",
         ],
         install_hint="pip install aiohttp httpx",
-        # Cron home-channel delivery via Nextcloud Talk REST API.
         standalone_sender_fn=_standalone_send,
         emoji="💬",
         allow_update_command=True,
-        # Env-driven auto-configuration (gateway status reflects env vars).
         env_enablement_fn=_env_enablement,
-        # Cron scheduler routing target.
         cron_deliver_env_var="NEXTCLOUD_TALK_HOME_CHANNEL",
-        # LLM guidance injected into system prompt.
         platform_hint="You are communicating via Nextcloud Talk. Use plain text or simple formatting.",
     )
