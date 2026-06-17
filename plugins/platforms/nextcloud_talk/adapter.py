@@ -62,6 +62,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.config import Platform
+from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
 
@@ -154,19 +155,23 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         # Maps IP -> list of failure timestamps (monotonic)
         self._failed_attempts: Dict[str, List[float]] = {}
 
+        # Maps IP -> block expiry timestamp (monotonic). Separate from
+        # _failed_attempts so the 30-min block survives window expiry.
+        self._blocked_ips: Dict[str, float] = {}
+
         # ── Room-based permission policies ──────────────────────────────
         allowed_users_raw = (
             extra.get("allowed_users")
             or os.getenv("NEXTCLOUD_TALK_ALLOWED_USERS", "")
         )
         if isinstance(allowed_users_raw, str):
-            self._allowed_users: set = set(
+            self._allowed_users = set(
                 u.strip() for u in allowed_users_raw.split(",") if u.strip()
             )
         elif isinstance(allowed_users_raw, (list, set)):
-            self._allowed_users: set = set(str(u) for u in allowed_users_raw)
+            self._allowed_users = set(str(u) for u in allowed_users_raw)
         else:
-            self._allowed_users: set = set()
+            self._allowed_users = set()
 
         self._group_policy: str = str(
             extra.get("group_policy")
@@ -183,13 +188,13 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             or os.getenv("NEXTCLOUD_TALK_ALLOWED_DM_USERS", "")
         )
         if isinstance(allowed_dm_raw, str):
-            self._allowed_dm_users: set = set(
+            self._allowed_dm_users = set(
                 u.strip() for u in allowed_dm_raw.split(",") if u.strip()
             )
         elif isinstance(allowed_dm_raw, (list, set)):
-            self._allowed_dm_users: set = set(str(u) for u in allowed_dm_raw)
+            self._allowed_dm_users = set(str(u) for u in allowed_dm_raw)
         else:
-            self._allowed_dm_users: set = set()
+            self._allowed_dm_users = set()
 
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -261,38 +266,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             await self._http_client.aclose()
             self._http_client = None
 
-    # ── Message handling ──────────────────────────────────────────────────
-
-    async def handle_message(self, event: MessageEvent) -> None:
-        """Process a received message event."""
-        # Delegate to base class for proper gateway routing
-        await super().handle_message(event)
-
-    async def _process_message(
-        self, event: MessageEvent, session_key: str
-    ) -> None:
-        """Process a message through the agent."""
-        handler = self._message_handler
-        if not handler:
-            return
-
-        try:
-            await handler(event, session_key)
-        except Exception:
-            logger.exception("Error processing nextcloud_talk message")
-        finally:
-            self._active_sessions.pop(session_key, None)
-
-    def _get_session_key(self, event: MessageEvent) -> str:
-        """Build a session key from the event source."""
-        source = getattr(event, "source", None)
-        room_token = (
-            getattr(source, "room_token", None)
-            or getattr(source, "chat_id", "")
-        )
-        sender = getattr(source, "user_id", "")
-        return f"nc:{room_token}:{sender}"
-
     # ── Webhook handler ───────────────────────────────────────────────────
 
     async def _handle_webhook(self, request: web.Request) -> web.Response:
@@ -317,14 +290,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             ):
                 # ── Rate limiting on signature failure (Improvement 1) ────
                 client_ip = request.remote  # aiohttp: remote is already a string (IP)
-                # Only record if not already blocked
-                if not self._is_rate_limited(client_ip):
-                    self._record_failed_attempt(client_ip)
-                    if self._is_rate_limited(client_ip):
-                        logger.warning("Rate limited: %s", client_ip)
-                        return _json_response(429, {"error": "Too many failed attempts"})
-                # Reset failed attempts on successful auth (unblock)
-                self._clear_failed_attempts(client_ip)
+                self._record_failed_attempt(client_ip)
+                if self._is_rate_limited(client_ip):
+                    logger.warning("Rate limited: %s", client_ip)
+                    return _json_response(429, {"error": "Too many failed attempts"})
 
                 logger.warning("Invalid signature from Nextcloud Talk")
                 return _json_response(
@@ -463,8 +432,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         is_group = data.get("isGroupChat", False)
 
         # Build SessionSource for gateway routing
-        from gateway.session import SessionSource
-
         source = SessionSource(
             platform=Platform("nextcloud_talk"),
             chat_id=room_token,
@@ -591,29 +558,37 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         records the block duration.
         """
         now = time.monotonic()
+
+        # Check explicit block first (survives window expiry)
+        block_expiry = self._blocked_ips.get(ip)
+        if block_expiry is not None:
+            if now < block_expiry:
+                return True
+            # Block expired — clear it
+            del self._blocked_ips[ip]
+            self._failed_attempts.pop(ip, None)
+            return False
+
         attempts = self._failed_attempts.get(ip, [])
 
         if not attempts:
             return False
 
-        # Check if currently blocked (has an old entry that triggers block)
+        # Prune entries outside the window
         recent = [t for t in attempts if now - t <= RATE_LIMIT_WINDOW_SECONDS]
         self._failed_attempts[ip] = recent
 
         if len(recent) >= RATE_LIMIT_MAX_ATTEMPTS:
             # Block for RATE_LIMIT_BLOCK_SECONDS
-            oldest = min(recent)
-            if now - oldest < RATE_LIMIT_BLOCK_SECONDS:
-                return True
-            # Block expired — clear and reset
-            self._clear_failed_attempts(ip)
-            return False
+            self._blocked_ips[ip] = now + RATE_LIMIT_BLOCK_SECONDS
+            return True
 
         return False
 
     def _clear_failed_attempts(self, ip: str) -> None:
         """Clear all failed attempt records for an IP (on successful auth)."""
         self._failed_attempts.pop(ip, None)
+        self._blocked_ips.pop(ip, None)
 
     # ── Improvement 2: Permission Policies ────────────────────────────────
 
@@ -752,6 +727,15 @@ async def _standalone_send(
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
+
+    def _env_enablement() -> dict | None:
+        base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
+        bot_token = os.getenv("NEXTCLOUD_TALK_BOT_TOKEN", "")
+        bot_secret = os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
+        if base_url and bot_token and bot_secret:
+            return {"extra": {"base_url": base_url, "bot_token": bot_token, "bot_secret": bot_secret}}
+        return None
+
     ctx.register_platform(
         name="nextcloud_talk",
         label="Nextcloud Talk",
@@ -769,4 +753,10 @@ def register(ctx) -> None:
         standalone_sender_fn=_standalone_send,
         emoji="💬",
         allow_update_command=True,
+        # Env-driven auto-configuration (gateway status reflects env vars).
+        env_enablement_fn=_env_enablement,
+        # Cron scheduler routing target.
+        cron_deliver_env_var="NEXTCLOUD_TALK_HOME_CHANNEL",
+        # LLM guidance injected into system prompt.
+        platform_hint="You are communicating via Nextcloud Talk. Use plain text or simple formatting.",
     )
