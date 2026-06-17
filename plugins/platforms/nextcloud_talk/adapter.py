@@ -24,7 +24,9 @@ Configuration in config.yaml::
 Or via environment variables (overrides config.yaml)::
 
     NEXTCLOUD_TALK_BASE_URL, NEXTCLOUD_TALK_BOT_TOKEN, NEXTCLOUD_TALK_BOT_SECRET,
-    NEXTCLOUD_TALK_HOST, NEXTCLOUD_TALK_PORT, NEXTCLOUD_TALK_PATH
+    NEXTCLOUD_TALK_HOST, NEXTCLOUD_TALK_PORT, NEXTCLOUD_TALK_PATH,
+    NEXTCLOUD_TALK_ALLOWED_USERS, NEXTCLOUD_TALK_GROUP_POLICY,
+    NEXTCLOUD_TALK_DM_POLICY, NEXTCLOUD_TALK_ALLOWED_DM_USERS
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ import logging
 import os
 import secrets
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     from aiohttp import web
@@ -74,6 +76,11 @@ RANDOM_HEADER = "x-nextcloud-talk-random"
 
 # Dedup TTL — messages older than this are considered unique again
 MESSAGE_DEDUP_TTL_SECONDS = 300
+
+# Rate limiting constants
+RATE_LIMIT_WINDOW_SECONDS = 300    # 5 minutes
+RATE_LIMIT_MAX_ATTEMPTS = 10       # max failures in window
+RATE_LIMIT_BLOCK_SECONDS = 1800    # 30 minutes block duration
 
 
 # ── Plugin helpers ────────────────────────────────────────────────────────
@@ -143,6 +150,47 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             extra.get("bot_secret", "") or os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
         )
 
+        # ── Rate limiting ───────────────────────────────────────────────
+        # Maps IP -> list of failure timestamps (monotonic)
+        self._failed_attempts: Dict[str, List[float]] = {}
+
+        # ── Room-based permission policies ──────────────────────────────
+        allowed_users_raw = (
+            extra.get("allowed_users")
+            or os.getenv("NEXTCLOUD_TALK_ALLOWED_USERS", "")
+        )
+        if isinstance(allowed_users_raw, str):
+            self._allowed_users: set = set(
+                u.strip() for u in allowed_users_raw.split(",") if u.strip()
+            )
+        elif isinstance(allowed_users_raw, (list, set)):
+            self._allowed_users: set = set(str(u) for u in allowed_users_raw)
+        else:
+            self._allowed_users: set = set()
+
+        self._group_policy: str = str(
+            extra.get("group_policy")
+            or os.getenv("NEXTCLOUD_TALK_GROUP_POLICY", "all")
+        )
+
+        self._dm_policy: str = str(
+            extra.get("dm_policy")
+            or os.getenv("NEXTCLOUD_TALK_DM_POLICY", "all")
+        )
+
+        allowed_dm_raw = (
+            extra.get("allowed_dm_users")
+            or os.getenv("NEXTCLOUD_TALK_ALLOWED_DM_USERS", "")
+        )
+        if isinstance(allowed_dm_raw, str):
+            self._allowed_dm_users: set = set(
+                u.strip() for u in allowed_dm_raw.split(",") if u.strip()
+            )
+        elif isinstance(allowed_dm_raw, (list, set)):
+            self._allowed_dm_users: set = set(str(u) for u in allowed_dm_raw)
+        else:
+            self._allowed_dm_users: set = set()
+
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         self._app: Optional[web.Application] = None
@@ -161,6 +209,18 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         if not self._base_url or not self._bot_token or not self._bot_secret:
             logger.error(
                 "nextcloud_talk requires base_url, bot_token, and bot_secret"
+            )
+            return False
+
+        # ── Config validation (Improvement 3) ───────────────────────────
+        if not self._validate_port(self._port):
+            logger.error("Invalid port: %d (must be 1-65535)", self._port)
+            return False
+
+        if not self._validate_base_url(self._base_url):
+            logger.error(
+                "Invalid base_url: %s (must start with http:// or https://)",
+                self._base_url,
             )
             return False
 
@@ -263,15 +323,32 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             if not self._verify_signature(
                 random_val, body, self._bot_secret, signature
             ):
+                # ── Rate limiting on signature failure (Improvement 1) ────
+                client_ip = request.remote  # aiohttp: remote is already a string (IP)
+                self._record_failed_attempt(client_ip)
+                if self._is_rate_limited(client_ip):
+                    logger.warning("Rate limited: %s", client_ip)
+                    return _json_response(429, {"error": "Too many failed attempts"})
+                # Reset failed attempts on successful auth (unblock)
+                self._clear_failed_attempts(client_ip)
+
                 logger.warning("Invalid signature from Nextcloud Talk")
                 return _json_response(
                     403, {"error": "Invalid signature"}
                 )
 
+            # Successful auth — clear rate-limit tracking for this IP
+            client_ip = request.remote
+            self._clear_failed_attempts(client_ip)
+
             data = json.loads(body)
             msg_event = self._parse_message(data)
             if not msg_event:
                 return _json_response(200, {"status": "ok"})
+
+            # ── Permission check (Improvement 2) ──────────────────────
+            if not self._check_permissions(msg_event):
+                return _json_response(200, {"status": "permission_denied"})
 
             # Dedup
             msg_id = msg_event.message_id
@@ -352,6 +429,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         }
         """
         activity_type = data.get("type", "")
+
+        # Handle Update and Delete gracefully
+        if activity_type == "Delete":
+            logger.debug("Ignoring Delete activity")
+            return None
+
+        if activity_type == "Update":
+            logger.debug("Ignoring Update activity")
+            return None
 
         # Only process "Create" activities (new messages)
         if activity_type != "Create":
@@ -481,6 +567,93 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: web.Request) -> web.Response:
         """Health check endpoint — OpenClaw-compatible /healthz."""
         return _json_response(200, {"status": "healthy"})
+
+    # ── Improvement 1: Rate Limiting ──────────────────────────────────────
+
+    def _record_failed_attempt(self, ip: str) -> None:
+        """Record a failed authentication attempt for the given IP."""
+        now = time.monotonic()
+        self._failed_attempts.setdefault(ip, []).append(now)
+
+    def _is_rate_limited(self, ip: str) -> bool:
+        """Check if the IP is rate-limited.
+
+        Returns True if the IP has exceeded RATE_LIMIT_MAX_ATTEMPTS failures
+        within RATE_LIMIT_WINDOW_SECONDS. If blocked, returns True and
+        records the block duration.
+        """
+        now = time.monotonic()
+        attempts = self._failed_attempts.get(ip, [])
+
+        if not attempts:
+            return False
+
+        # Check if currently blocked (has an old entry that triggers block)
+        recent = [t for t in attempts if now - t <= RATE_LIMIT_WINDOW_SECONDS]
+        self._failed_attempts[ip] = recent
+
+        if len(recent) >= RATE_LIMIT_MAX_ATTEMPTS:
+            # Block for RATE_LIMIT_BLOCK_SECONDS
+            oldest = min(recent)
+            if now - oldest < RATE_LIMIT_BLOCK_SECONDS:
+                return True
+            # Block expired — clear and reset
+            self._clear_failed_attempts(ip)
+            return False
+
+        return False
+
+    def _clear_failed_attempts(self, ip: str) -> None:
+        """Clear all failed attempt records for an IP (on successful auth)."""
+        self._failed_attempts.pop(ip, None)
+
+    # ── Improvement 2: Permission Policies ────────────────────────────────
+
+    def _check_permissions(self, event: MessageEvent) -> bool:
+        """Check if the sender is authorized to send messages.
+
+        Returns True if allowed, False if denied (logged but not blocked).
+        """
+        source = getattr(event, "source", None)
+        if not source:
+            return True
+
+        sender_id = getattr(source, "user_id", "")
+        chat_type = getattr(source, "chat_type", "unknown")
+
+        # Group policy check
+        if chat_type == "group" and self._group_policy == "members":
+            if self._allowed_users and sender_id not in self._allowed_users:
+                logger.info(
+                    "Permission denied: user %s not in allowed_users for group chat",
+                    sender_id,
+                )
+                return False
+
+        # DM policy check
+        if chat_type == "dm" and self._dm_policy == "restricted":
+            if self._allowed_dm_users and sender_id not in self._allowed_dm_users:
+                logger.info(
+                    "Permission denied: user %s not in allowed_dm_users for DM",
+                    sender_id,
+                )
+                return False
+
+        return True
+
+    # ── Improvement 3: Config Validation ──────────────────────────────────
+
+    @staticmethod
+    def _validate_port(port: int) -> bool:
+        """Validate that port is in the valid range 1-65535."""
+        return isinstance(port, int) and 1 <= port <= 65535
+
+    @staticmethod
+    def _validate_base_url(url: str) -> bool:
+        """Validate that the base URL starts with http:// or https://."""
+        return isinstance(url, str) and (
+            url.startswith("http://") or url.startswith("https://")
+        )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────

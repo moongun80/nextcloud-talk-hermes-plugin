@@ -34,3 +34,19 @@ optional_env:
     description: "Webhook callback path (default: /nextcloud-talk/callback)"
     prompt: "Webhook path"
     password: false
+  - name: NEXTCLOUD_TALK_ALLOWED_USERS
+    description: "Comma-separated list of allowed user IDs for group chats (when group_policy=members)"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: NEXTCLOUD_TALK_GROUP_POLICY
+    description: 'Group chat policy: "all" (default), "members" (only allowed_users)'
+    prompt: "Group policy"
+    password: false
+  - name: NEXTCLOUD_TALK_DM_POLICY
+    description: 'DM policy: "all" (default), "restricted" (only allowed_dm_users)'
+    prompt: "DM policy"
+    password: false
+  - name: NEXTCLOUD_TALK_ALLOWED_DM_USERS
+    description: "Comma-separated list of allowed user IDs for DMs (when dm_policy=restricted)"
+    prompt: "Allowed DM users (comma-separated)"
+    password: false
