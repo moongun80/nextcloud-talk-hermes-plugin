@@ -510,9 +510,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         if reply_to:
             payload["replyTo"] = reply_to
 
-        # Generate HMAC signature
+        # Serialize payload for both sending and signing
+        payload_body = json.dumps(payload)
+
+        # Generate HMAC signature over random + JSON body (matching Nextcloud Bot API spec)
         random_value = secrets.token_hex(16)
-        signing_input = random_value + content
+        signing_input = random_value + payload_body
         signature = hmac.new(
             self._bot_secret.encode("utf-8"),
             signing_input.encode("utf-8"),
@@ -526,7 +529,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         try:
             resp = await self._http_client.post(
-                url, json=payload, headers=headers
+                url,
+                content=payload_body.encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    **headers,
+                },
             )
             if resp.status_code in (200, 201):
                 logger.debug(
@@ -703,8 +711,12 @@ async def _standalone_send(
         f"{room_token}/message"
     )
 
+    # Build payload and serialize for both sending and signing
+    payload_body = json.dumps({"message": message})
+
+    # Generate HMAC signature over random + JSON body
     random_value = secrets.token_hex(16)
-    signing_input = random_value + message
+    signing_input = random_value + payload_body
     signature = hmac.new(
         bot_secret.encode("utf-8"),
         signing_input.encode("utf-8"),
@@ -715,10 +727,11 @@ async def _standalone_send(
         async with _httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 url,
-                json={"message": message},
+                content=payload_body.encode("utf-8"),
                 headers={
                     "Authorization": f"Bearer {bot_token}",
                     "OCS-ApiRequest": "true",
+                    "Content-Type": "application/json",
                     RANDOM_HEADER: random_value,
                     SIGNATURE_HEADER: signature,
                 },
