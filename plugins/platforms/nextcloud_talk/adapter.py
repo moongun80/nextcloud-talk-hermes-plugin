@@ -108,11 +108,6 @@ def validate_config(config) -> bool:
     return bool(base_url and bot_token and bot_secret)
 
 
-def is_connected(config) -> bool:
-    """Check if the platform is connected (env vars set + deps available)."""
-    return check_requirements()
-
-
 # ── Adapter ───────────────────────────────────────────────────────────────
 
 class NextcloudTalkAdapter(BasePlatformAdapter):
@@ -155,10 +150,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._blocked_ips: Dict[str, float] = {}
 
         # ── Room-based permission policies ──────────────────────────────
-        allowed_users_raw = (
-            extra.get("allowed_users")
-            or os.getenv("NEXTCLOUD_TALK_ALLOWED_USERS", "")
-        )
+        # Use `is None` checks (not `or`) so empty lists are preserved as
+        # valid values (empty whitelist = deny all).
+        allowed_users_raw = extra.get("allowed_users")
+        if allowed_users_raw is None:
+            allowed_users_raw = os.getenv("NEXTCLOUD_TALK_ALLOWED_USERS", "")
         if isinstance(allowed_users_raw, str):
             self._allowed_users = set(
                 u.strip() for u in allowed_users_raw.split(",") if u.strip()
@@ -178,10 +174,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             or os.getenv("NEXTCLOUD_TALK_DM_POLICY", "all")
         )
 
-        allowed_dm_raw = (
-            extra.get("allowed_dm_users")
-            or os.getenv("NEXTCLOUD_TALK_ALLOWED_DM_USERS", "")
-        )
+        allowed_dm_raw = extra.get("allowed_dm_users")
+        if allowed_dm_raw is None:
+            allowed_dm_raw = os.getenv("NEXTCLOUD_TALK_ALLOWED_DM_USERS", "")
         if isinstance(allowed_dm_raw, str):
             self._allowed_dm_users = set(
                 u.strip() for u in allowed_dm_raw.split(",") if u.strip()
@@ -670,7 +665,6 @@ def register(ctx) -> None:
         adapter_factory=lambda cfg: NextcloudTalkAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
-        is_connected=is_connected,
         required_env=[
             "NEXTCLOUD_TALK_BASE_URL",
             "NEXTCLOUD_TALK_BOT_TOKEN",

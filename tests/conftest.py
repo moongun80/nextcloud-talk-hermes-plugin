@@ -13,10 +13,11 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# Add the Hermes gateway so gateway imports resolve
+# Add the Hermes gateway so gateway imports resolve (append, not prepend,
+# so the project's own adapter.py takes priority over hermes-agent's copy)
 HERMES_GATEWAY = os.path.expanduser("~/.hermes/hermes-agent")
 if HERMES_GATEWAY not in sys.path:
-    sys.path.insert(0, HERMES_GATEWAY)
+    sys.path.append(HERMES_GATEWAY)
 
 
 # ── Fake config object ────────────────────────────────────────────────────

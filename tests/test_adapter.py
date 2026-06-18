@@ -5,14 +5,20 @@ from __future__ import annotations
 import os
 import sys
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Ensure project root is on sys.path
+# Ensure project root is on sys.path (FIRST so our adapter.py takes priority)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+# Remove hermes-agent path if present — we want project's adapter.py, not hers
+HERMES_GATEWAY = os.path.expanduser("~/.hermes/hermes-agent")
+if HERMES_GATEWAY in sys.path:
+    sys.path.remove(HERMES_GATEWAY)
+    sys.path.insert(0, PROJECT_ROOT)  # re-insert project root at front
 
 from plugins.platforms.nextcloud_talk.adapter import (
     NextcloudTalkAdapter,
@@ -37,8 +43,10 @@ def _make_adapter(extra: dict | None = None, **env_overrides) -> NextcloudTalkAd
     for k, v in env_overrides.items():
         os.environ[k] = str(v)
 
-    config = MagicMock()
-    config.extra = extra or {}
+    # Use SimpleNamespace so getattr(config, "extra", {}) returns the actual
+    # dict value (including empty lists), unlike MagicMock which returns
+    # MagicMock for any attribute access.
+    config = SimpleNamespace(extra=extra or {})
 
     adapter = NextcloudTalkAdapter(config)
 
@@ -389,6 +397,60 @@ class TestPermissionPolicies:
         )
         # DM should be allowed even with empty allowed_users for groups
         assert adapter._check_permissions(event) is True
+
+    def test_group_members_policy_empty_whitelist_blocks_all(self):
+        """group_policy='members' + empty allowed_users should block everyone in groups."""
+        adapter = _make_adapter(extra={
+            "group_policy": "members",
+            "allowed_users": [],
+        })
+        from gateway.session import SessionSource
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        source = SessionSource(
+            platform=Platform("nextcloud_talk"),
+            chat_id="room-xyz",
+            chat_name="room-xyz",
+            chat_type="group",
+            user_id="anyone",
+            user_name="Anyone",
+        )
+        event = MessageEvent(
+            text="test",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={},
+        )
+        # Empty whitelist → deny all
+        assert adapter._check_permissions(event) is False
+
+    def test_dm_restricted_empty_whitelist_blocks_all(self):
+        """dm_policy='restricted' + empty allowed_dm_users should block all DMs."""
+        adapter = _make_adapter(extra={
+            "dm_policy": "restricted",
+            "allowed_dm_users": [],
+        })
+        from gateway.session import SessionSource
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        source = SessionSource(
+            platform=Platform("nextcloud_talk"),
+            chat_id="dm-xyz",
+            chat_name="dm-xyz",
+            chat_type="dm",
+            user_id="anyone",
+            user_name="Anyone",
+        )
+        event = MessageEvent(
+            text="test",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={},
+        )
+        # Empty whitelist → deny all
+        assert adapter._check_permissions(event) is False
 
     def test_env_var_allowed_users(self):
         """allowed_users from environment variable should be parsed correctly."""
