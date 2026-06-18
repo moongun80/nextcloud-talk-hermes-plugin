@@ -269,7 +269,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 logger.warning("Missing signature or random header from Nextcloud")
                 return _json_response(400, {"error": "Missing signature/random headers"})
 
-            client_ip = request.remote
+            client_ip = request.remote or "unknown"
 
             if not self._verify_signature(random_val, body, self._bot_secret, signature):
                 self._record_failed_attempt(client_ip)
@@ -473,8 +473,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         pass
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        """Return chat info."""
-        return {"name": chat_id, "type": "group"}
+        """Return chat info. Type is unknown without a session lookup."""
+        return {"name": chat_id, "type": "unknown"}
 
     def format_message(self, content: str) -> str:
         """Nextcloud Talk supports rich text — pass through."""
@@ -608,8 +608,8 @@ async def _standalone_send(
     )
     room_token = chat_id
 
-    if not base_url or not bot_token or not room_token:
-        return {"error": "Missing NEXTCLOUD_TALK_BASE_URL, BOT_TOKEN, or chat_id"}
+    if not base_url or not bot_token or not bot_secret or not room_token:
+        return {"error": "Missing NEXTCLOUD_TALK_BASE_URL, BOT_TOKEN, BOT_SECRET, or chat_id"}
 
     url = (
         f"{base_url.rstrip('/')}/ocs/v2.php/apps/spreed/api/v1/bot/"
