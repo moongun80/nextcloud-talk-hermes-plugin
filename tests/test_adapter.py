@@ -30,14 +30,22 @@ from plugins.platforms.nextcloud_talk.adapter import (
 
 def _make_adapter(extra: dict | None = None, **env_overrides) -> NextcloudTalkAdapter:
     """Helper to create a NextcloudTalkAdapter with minimal setup."""
+    # All env vars this helper may touch — back up and restore all of them
+    _ALL_KEYS = (
+        "NEXTCLOUD_TALK_BASE_URL",
+        "NEXTCLOUD_TALK_BOT_TOKEN",
+        "NEXTCLOUD_TALK_BOT_SECRET",
+        "NEXTCLOUD_TALK_ALLOWED_USERS",
+        "NEXTCLOUD_TALK_GROUP_POLICY",
+        "NEXTCLOUD_TALK_DM_POLICY",
+        "NEXTCLOUD_TALK_ALLOWED_DM_USERS",
+    )
     env_backup = {}
-    for key in ("NEXTCLOUD_TALK_BASE_URL", "NEXTCLOUD_TALK_BOT_TOKEN",
-                "NEXTCLOUD_TALK_BOT_SECRET"):
+    for key in _ALL_KEYS:
         if key in os.environ:
             env_backup[key] = os.environ[key]
 
     os.environ["NEXTCLOUD_TALK_BASE_URL"] = "https://nc.example.com"
-    os.environ["NEXTCLOUD_TALK_BOT_TOKEN"] = "test-token"
     os.environ["NEXTCLOUD_TALK_BOT_SECRET"] = "test-secret"
 
     for k, v in env_overrides.items():
@@ -53,8 +61,7 @@ def _make_adapter(extra: dict | None = None, **env_overrides) -> NextcloudTalkAd
     # Restore env
     for key in env_backup:
         os.environ[key] = env_backup[key]
-    for key in ("NEXTCLOUD_TALK_BASE_URL", "NEXTCLOUD_TALK_BOT_TOKEN",
-                "NEXTCLOUD_TALK_BOT_SECRET"):
+    for key in _ALL_KEYS:
         if key not in env_backup:
             os.environ.pop(key, None)
 
