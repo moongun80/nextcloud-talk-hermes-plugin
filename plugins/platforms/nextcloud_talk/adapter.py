@@ -150,6 +150,13 @@ class _check_requirements_state:
     _has_secret = False
     _has_base_url = False
 
+    @classmethod
+    def reset(cls):
+        """Reset state for test isolation."""
+        cls._has_config = False
+        cls._has_secret = False
+        cls._has_base_url = False
+
 
 def validate_config(config) -> bool:
     """Validate that the platform config has required fields."""
@@ -170,6 +177,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     """
 
     supports_code_blocks: bool = True
+    _max_message_length: int = int(os.getenv("NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH", "65536"))
 
     def __init__(self, config, **kwargs):
         platform = Platform("nextcloud_talk")
@@ -553,10 +561,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         actor = data.get("actor", {})
         sender_id = str(actor.get("id", ""))
         sender_name = str(actor.get("name", "") or "")
-        # Strip trailing '-Bot' suffix (e.g. "MyBot-Bot" -> "MyBot")
-        # so sender auth matches the actual bot identity.
-        if sender_name.endswith("-Bot"):
-            sender_name = sender_name[:-4]
 
         target = data.get("target", {})
         # ── M2 FIX: target.id is the room token directly, not a URL ────
@@ -566,19 +570,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             logger.debug("No room token in target.id, skipping")
             return None
 
-        # ── M1 FIX: Determine chat_type from target.type per spec ───────
-        # Per Nextcloud Talk Bot API spec, target.type indicates the room:
-        #   "Direct" = DM, "Group" = group chat, "OneToOne" = DM
-        # Fallback: check isGroupChat legacy field, then default to DM.
-        target_type = str(target.get("type", "") or "").lower()
-        if target_type in ("direct", "oneonone"):
-            chat_type = "dm"
-        elif target_type == "group":
-            chat_type = "group"
-        else:
-            # Legacy fallback
-            is_group = data.get("isGroupChat", False)
-            chat_type = "group" if is_group else "dm"
+        # Legacy fallback: check isGroupChat, then default to DM.
+        is_group = data.get("isGroupChat", False)
+        chat_type = "group" if is_group else "dm"
 
         room_name = str(target.get("name", "") or "")
 

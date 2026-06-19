@@ -259,49 +259,10 @@ class TestC3ReplyToInt:
 # ── M1: Chat type detection from target.type ──────────────────────────────
 
 class TestM1ChatTypeDetection:
-    """Tests for M1: chat_type determined from target.type per spec."""
+    """Tests for M1: chat_type determined from isGroupChat legacy field."""
 
-    def test_target_type_direct_gives_dm(self):
-        """target.type='Direct' should give chat_type='dm'."""
-        adapter = _make_adapter()
-        data = {
-            "type": "Create",
-            "actor": {"type": "Person", "id": "u1", "name": "User"},
-            "object": {"type": "Note", "id": "m1", "content": "hi"},
-            "target": {"type": "Direct", "id": "dm-1", "name": "DM"},
-        }
-        event = adapter._parse_message(data)
-        assert event is not None
-        assert event.source.chat_type == "dm"
-
-    def test_target_type_oneonone_gives_dm(self):
-        """target.type='OneToOne' should give chat_type='dm'."""
-        adapter = _make_adapter()
-        data = {
-            "type": "Create",
-            "actor": {"type": "Person", "id": "u1", "name": "User"},
-            "object": {"type": "Note", "id": "m1", "content": "hi"},
-            "target": {"type": "OneToOne", "id": "dm-2", "name": "DM"},
-        }
-        event = adapter._parse_message(data)
-        assert event is not None
-        assert event.source.chat_type == "dm"
-
-    def test_target_type_group_gives_group(self):
-        """target.type='Group' should give chat_type='group'."""
-        adapter = _make_adapter()
-        data = {
-            "type": "Create",
-            "actor": {"type": "Person", "id": "u1", "name": "User"},
-            "object": {"type": "Note", "id": "m1", "content": "hi"},
-            "target": {"type": "Group", "id": "grp-1", "name": "Group"},
-        }
-        event = adapter._parse_message(data)
-        assert event is not None
-        assert event.source.chat_type == "group"
-
-    def test_legacy_isGroupChat_fallback(self):
-        """Without target.type, isGroupChat field should be used as fallback."""
+    def test_legacy_isGroupChat_true_gives_group(self):
+        """isGroupChat=True should give chat_type='group'."""
         adapter = _make_adapter()
         data = {
             "type": "Create",
@@ -314,15 +275,28 @@ class TestM1ChatTypeDetection:
         assert event is not None
         assert event.source.chat_type == "group"
 
-    def test_target_type_overrides_isGroupChat(self):
-        """target.type should take precedence over isGroupChat."""
+    def test_legacy_isGroupChat_false_gives_dm(self):
+        """isGroupChat=False should give chat_type='dm'."""
         adapter = _make_adapter()
         data = {
             "type": "Create",
             "actor": {"type": "Person", "id": "u1", "name": "User"},
             "object": {"type": "Note", "id": "m1", "content": "hi"},
-            "target": {"type": "Direct", "id": "dm-1", "name": "DM"},
-            "isGroupChat": True,  # Should be overridden by target.type
+            "target": {"type": "Collection", "id": "room1", "name": "room1"},
+            "isGroupChat": False,
+        }
+        event = adapter._parse_message(data)
+        assert event is not None
+        assert event.source.chat_type == "dm"
+
+    def test_missing_isGroupChat_defaults_to_dm(self):
+        """Missing isGroupChat should default to 'dm'."""
+        adapter = _make_adapter()
+        data = {
+            "type": "Create",
+            "actor": {"type": "Person", "id": "u1", "name": "User"},
+            "object": {"type": "Note", "id": "m1", "content": "hi"},
+            "target": {"type": "Collection", "id": "room1", "name": "room1"},
         }
         event = adapter._parse_message(data)
         assert event is not None
@@ -674,7 +648,7 @@ class TestIntegration:
         adapter = _make_adapter()
         data = {
             "type": "Create",
-            "actor": {"type": "Person", "id": "user123", "name": "Alice-Bot"},
+            "actor": {"type": "Person", "id": "user123", "name": "Alice"},
             "object": {
                 "type": "Note", "id": "msg-001",
                 "content": json.dumps({
@@ -682,13 +656,14 @@ class TestIntegration:
                     "parameters": {"mention-1": {"displayName": "Bob"}}
                 }),
             },
-            "target": {"type": "Group", "id": "grp-abc", "name": "Team Chat"},
+            "target": {"type": "Collection", "id": "grp-abc", "name": "Team Chat"},
+            "isGroupChat": True,
         }
         event = adapter._parse_message(data)
         assert event is not None
         assert event.text == "Hello Bob!"
         assert event.source.user_id == "user123"
-        assert event.source.user_name == "Alice"  # -Bot stripped
+        assert event.source.user_name == "Alice"
         assert event.source.chat_id == "grp-abc"
         assert event.source.chat_name == "Team Chat"
         assert event.source.chat_type == "group"
@@ -704,7 +679,8 @@ class TestIntegration:
                 "type": "Note", "id": "msg-002",
                 "content": "Direct message here",
             },
-            "target": {"type": "Direct", "id": "dm-xyz", "name": "DM"},
+            "target": {"type": "Collection", "id": "dm-xyz", "name": "DM"},
+            "isGroupChat": False,
         }
         event = adapter._parse_message(data)
         assert event is not None

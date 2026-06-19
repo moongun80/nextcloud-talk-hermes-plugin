@@ -116,7 +116,6 @@ gateway:
       enabled: true
       extra:
         base_url: "https://your-nextcloud.example.com"
-        bot_token: "your-access-token-here"
         bot_secret: "your-hmac-secret-here"
         host: "0.0.0.0"
         port: 8745

@@ -34,9 +34,7 @@ def _make_adapter(extra: dict | None = None, **env_overrides) -> NextcloudTalkAd
     # All env vars this helper may touch — back up and restore all of them
     _ALL_KEYS = (
         "NEXTCLOUD_TALK_BASE_URL",
-        "NEXTCLOUD_TALK_BOT_TOKEN",
         "NEXTCLOUD_TALK_BOT_SECRET",
-        "NEXTCLOUD_TALK_ALLOWED_USERS",
         "NEXTCLOUD_TALK_GROUP_POLICY",
         "NEXTCLOUD_TALK_DM_POLICY",
         "NEXTCLOUD_TALK_ALLOWED_DM_USERS",
@@ -483,56 +481,6 @@ class TestPermissionPolicies:
             NEXTCLOUD_TALK_DM_POLICY="restricted",
         )
         assert adapter._dm_policy == "restricted"
-
-
-# ── C2: -Bot suffix stripping tests ────────────────────────────────────────
-
-class TestBotSuffixStripping:
-    """Tests for sender name -Bot suffix removal."""
-
-    def test_bot_suffix_stripped(self, sample_create_payload):
-        """Sender name ending in '-Bot' should be stripped."""
-        adapter = _make_adapter()
-        payload = dict(sample_create_payload)
-        payload["actor"]["name"] = "MyBot-Bot"
-        event = adapter._parse_message(payload)
-        assert event is not None
-        assert event.source.user_name == "MyBot"
-
-    def test_no_suffix_unchanged(self, sample_create_payload):
-        """Sender name without -Bot suffix should be unchanged."""
-        adapter = _make_adapter()
-        payload = dict(sample_create_payload)
-        payload["actor"]["name"] = "RegularUser"
-        event = adapter._parse_message(payload)
-        assert event is not None
-        assert event.source.user_name == "RegularUser"
-
-    def test_empty_name_no_crash(self):
-        """Empty sender name should not crash."""
-        adapter = _make_adapter()
-        event = adapter._parse_message({
-            "type": "Create",
-            "actor": {"type": "Person", "id": "u1", "name": ""},
-            "object": {"type": "Note", "id": "m1", "content": "hi"},
-            "target": {"type": "Collection", "id": "r1", "name": "r1"},
-            "isGroupChat": False,
-        })
-        assert event is not None
-        assert event.source.user_name == ""
-
-    def test_none_name_no_crash(self):
-        """None sender name should not crash."""
-        adapter = _make_adapter()
-        event = adapter._parse_message({
-            "type": "Create",
-            "actor": {"type": "Person", "id": "u1", "name": None},
-            "object": {"type": "Note", "id": "m1", "content": "hi"},
-            "target": {"type": "Collection", "id": "r1", "name": "r1"},
-            "isGroupChat": False,
-        })
-        assert event is not None
-        assert event.source.user_name == ""
 
 
 # ── C3: replyTo integer conversion tests ───────────────────────────────────
