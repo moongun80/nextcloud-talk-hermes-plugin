@@ -43,3 +43,15 @@ optional_env:
     description: "Comma-separated list of allowed user IDs for DMs (when dm_policy=restricted)"
     prompt: "Allowed DM users (comma-separated)"
     password: false
+  - name: NEXTCLOUD_TALK_HOME_CHANNEL
+    description: "Room token for cron job delivery (deliver=nextcloud_talk)"
+    prompt: "Cron home channel (room token)"
+    password: false
+  - name: NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH
+    description: "Max message length to prevent 413 errors (default: 32000)"
+    prompt: "Max message length"
+    password: false
+  - name: NEXTCLOUD_TALK_TRUSTED_PROXIES
+    description: "Comma-separated CIDR ranges for reverse proxy trust (e.g., 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16)"
+    prompt: "Trusted proxy CIDRs (leave empty to trust no proxies)"
+    password: false

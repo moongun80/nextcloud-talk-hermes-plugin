@@ -4,11 +4,11 @@ Receives chat messages via HTTP POST webhook (ActivityPub-style payloads),
 verifies HMAC-SHA256 signatures, and sends responses back via the Talk
 Bot API.
 
-Authentication is HMAC-SHA256 signature-based only — no bot token concept.
-Receiving (NC → bot): server signs with secret → bot verifies.
-Sending (bot → NC): bot signs with secret → server verifies.
+Authentication is HMAC-SHA256 signature-based only -- no bot token concept.
+Receiving (NC -> bot): server signs with secret -> bot verifies.
+Sending (bot -> NC): bot signs with secret -> server verifies.
 
-Thin protocol bridge — session management, message routing, and background
+Thin protocol bridge -- session management, message routing, and background
 task lifecycle are handled by BasePlatformAdapter.
 
 Configuration in config.yaml::
@@ -29,7 +29,9 @@ Or via environment variables (overrides config.yaml)::
     NEXTCLOUD_TALK_BASE_URL, NEXTCLOUD_TALK_BOT_SECRET,
     NEXTCLOUD_TALK_HOST, NEXTCLOUD_TALK_PORT, NEXTCLOUD_TALK_PATH,
     NEXTCLOUD_TALK_ALLOWED_USERS, NEXTCLOUD_TALK_GROUP_POLICY,
-    NEXTCLOUD_TALK_DM_POLICY, NEXTCLOUD_TALK_ALLOWED_DM_USERS
+    NEXTCLOUD_TALK_DM_POLICY, NEXTCLOUD_TALK_ALLOWED_DM_USERS,
+    NEXTCLOUD_TALK_TRUSTED_PROXIES, NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH,
+    NEXTCLOUD_TALK_HOME_CHANNEL
 """
 
 from __future__ import annotations
@@ -39,9 +41,10 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 try:
     from aiohttp import web
@@ -72,33 +75,80 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8745
 DEFAULT_PATH = "/nextcloud-talk/callback"
+DEFAULT_MAX_MESSAGE_LENGTH = 32000  # Nextcloud Bot API limit (newer servers)
 
-# Webhook headers (case-insensitive in aiohttp)
+# ── Receive-direction headers (NC -> bot) ────────────────────────────────
 SIGNATURE_HEADER = "x-nextcloud-talk-signature"
 RANDOM_HEADER = "x-nextcloud-talk-random"
 
-# Dedup TTL — messages older than this are considered unique again
+# ── Send-direction headers (bot -> NC) ───────────────────────────────────
+# These MUST include the "-Bot-" segment per the Nextcloud Talk Bot API spec.
+# Using receive-direction headers causes 401 Unauthenticated.
+SEND_RANDOM_HEADER = "x-nextcloud-talk-bot-random"
+SEND_SIGNATURE_HEADER = "x-nextcloud-talk-bot-signature"
+
+# ── Dedup TTL -- messages older than this are considered unique again ────
 MESSAGE_DEDUP_TTL_SECONDS = 300
 
-# Rate limiting constants
+# ── Replay protection TTL (separate from message dedup) ──────────────────
+REPLAY_RANDOM_TTL_SECONDS = 300
+
+# ── Rate limiting constants ─────────────────────────────────────────────
 RATE_LIMIT_WINDOW_SECONDS = 300    # 5 minutes
 RATE_LIMIT_MAX_ATTEMPTS = 10       # max failures in window
 RATE_LIMIT_BLOCK_SECONDS = 1800    # 30 minutes block duration
+
+# ── Trusted proxies (CIDR notation) ──────────────────────────────────────
+# Empty set = trust no proxies (use X-Forwarded-For directly).
+# Set to {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} for private networks.
+_DEFAULT_TRUSTED_PROXIES: Set[str] = set()
 
 
 # ── Plugin helpers ────────────────────────────────────────────────────────
 
 def check_requirements() -> bool:
-    """Return True if the Nextcloud Talk adapter can be used."""
-    secret = os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
-    base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
-    if not secret or not base_url:
-        logger.debug("Nextcloud Talk: required env vars not set")
-        return False
+    """Return True if the Nextcloud Talk adapter can be used.
+
+    Checks both environment variables and module-level config state
+    (populated by __init__ when the adapter is instantiated).
+    """
+    global _DEFAULT_TRUSTED_PROXIES
+
+    # Module-level state set by __init__ (covers config.yaml-only setup)
+    if getattr(_check_requirements_state, "_has_config", False):
+        if not getattr(_check_requirements_state, "_has_secret", False):
+            logger.debug("Nextcloud Talk: bot_secret not in config")
+            return False
+        if not getattr(_check_requirements_state, "_has_base_url", False):
+            logger.debug("Nextcloud Talk: base_url not in config")
+            return False
+    else:
+        # Fallback: check env vars
+        secret = os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
+        base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
+        if not secret or not base_url:
+            logger.debug("Nextcloud Talk: required env vars not set")
+            return False
+
     if not AIOHTTP_AVAILABLE or not HTTPX_AVAILABLE:
         logger.warning("Nextcloud Talk: aiohttp and httpx required")
         return False
+
+    # Parse trusted proxies from env if set
+    trusted_str = os.getenv("NEXTCLOUD_TALK_TRUSTED_PROXIES", "")
+    if trusted_str:
+        _DEFAULT_TRUSTED_PROXIES = {
+            p.strip() for p in trusted_str.split(",") if p.strip()
+        }
+
     return True
+
+
+# Module-level state container for check_requirements (bridge config.yaml gap)
+class _check_requirements_state:
+    _has_config = False
+    _has_secret = False
+    _has_base_url = False
 
 
 def validate_config(config) -> bool:
@@ -143,9 +193,24 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             extra.get("bot_secret", "") or os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
         )
 
+        # Max message length (prevent 413 errors from oversized payloads)
+        self._max_message_length: int = int(
+            extra.get("max_message_length")
+            or os.getenv("NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH", DEFAULT_MAX_MESSAGE_LENGTH)
+        )
+
         # ── Rate limiting ───────────────────────────────────────────────
         self._failed_attempts: Dict[str, List[float]] = {}
         self._blocked_ips: Dict[str, float] = {}
+
+        # ── Replay protection ───────────────────────────────────────────
+        # Track seen random values with monotonic timestamps.
+        # Prevents replay attacks even after message dedup TTL expires.
+        self._seen_randoms: Dict[str, float] = {}
+
+        # ── Message deduplication ───────────────────────────────────────
+        # Track seen message IDs with monotonic timestamps.
+        self._seen_messages: Dict[str, float] = {}
 
         # ── Room-based permission policies ──────────────────────────────
         # Use `is None` checks (not `or`) so empty lists are preserved as
@@ -188,7 +253,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._site: Optional[web.TCPSite] = None
         self._app: Optional[web.Application] = None
         self._http_client: Optional[httpx.AsyncClient] = None
-        self._seen_messages: Dict[str, float] = {}
+
+        # ── Register module-level state for check_requirements ──────────
+        _check_requirements_state._has_config = True
+        _check_requirements_state._has_secret = bool(self._bot_secret)
+        _check_requirements_state._has_base_url = bool(self._base_url)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -241,14 +310,37 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
-        """Stop the webhook HTTP server."""
+        """Stop the webhook HTTP server and clean up all resources."""
         self._running = False
         self._mark_disconnected()
+
+        # Clean up all resources in reverse order of creation
+        if self._site:
+            try:
+                await self._site.stop()
+            except Exception:
+                pass
+            self._site = None
+
         if self._runner:
-            await self._runner.cleanup()
+            try:
+                await self._runner.cleanup()
+            except Exception:
+                pass
             self._runner = None
+
+        if self._app:
+            try:
+                await self._app.shutdown()
+            except Exception:
+                pass
+            self._app = None
+
         if self._http_client:
-            await self._http_client.aclose()
+            try:
+                await self._http_client.aclose()
+            except Exception:
+                pass
             self._http_client = None
 
     # ── Webhook handler ───────────────────────────────────────────────────
@@ -266,7 +358,13 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 logger.warning("Missing signature or random header from Nextcloud")
                 return _json_response(400, {"error": "Missing signature/random headers"})
 
-            client_ip = request.remote or "unknown"
+            # Get real client IP (respecting X-Forwarded-For for proxied setups)
+            client_ip = self._get_client_ip(request)
+
+            # ── Replay protection: reject reused random values ────────────
+            if self._is_replayed_random(random_val):
+                logger.warning("Rejected replayed random value from %s", client_ip)
+                return _json_response(400, {"error": "Replayed request"})
 
             if not self._verify_signature(random_val, body, self._bot_secret, signature):
                 self._record_failed_attempt(client_ip)
@@ -278,28 +376,27 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
             self._clear_failed_attempts(client_ip)
 
+            # ── Parse payload ───────────────────────────────────────────
+            # object.content is JSON-encoded per spec, but handle plain-text
+            # gracefully (some clients may send raw bodies).
             try:
                 data = json.loads(body)
             except json.JSONDecodeError:
-                # Nextcloud may send plain-text body (not JSON-wrapped).
-                # Treat the raw body as message content and fabricate a
-                # minimal MessageEvent so the bot can still process it.
+                # Plain-text body: fabricate a minimal MessageEvent
                 plain_text = body.strip()
                 if not plain_text:
                     return _json_response(200, {"status": "ok"})
-                msg_event = self._parse_message({
+                logger.warning("Received non-JSON webhook body, treating as plain text")
+                data = {
                     "type": "Create",
                     "actor": {"type": "Person", "id": "unknown", "name": "anonymous"},
                     "object": {"type": "Note", "id": f"plain-{int(time.time()*1000)}", "content": plain_text},
                     "target": {"type": "Collection", "id": "unknown", "name": "unknown"},
-                    "isGroupChat": False,
-                })
-                if not msg_event:
-                    return _json_response(200, {"status": "ok"})
-            else:
-                msg_event = self._parse_message(data)
-                if not msg_event:
-                    return _json_response(200, {"status": "ok"})
+                }
+
+            msg_event = self._parse_message(data)
+            if not msg_event:
+                return _json_response(200, {"status": "ok"})
 
             if not self._check_permissions(msg_event):
                 return _json_response(200, {"status": "permission_denied"})
@@ -319,6 +416,73 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("Error handling Nextcloud webhook")
             return _json_response(500, {"error": "Internal error"})
+
+    # ── Client IP extraction (X-Forwarded-For) ────────────────────────────
+
+    def _get_client_ip(self, request: web.Request) -> str:
+        """Get the real client IP, respecting X-Forwarded-For for proxied setups.
+
+        If trusted proxies are configured, uses the last untrusted IP in
+        X-Forwarded-For. Otherwise falls back to request.remote.
+        """
+        trusted = _DEFAULT_TRUSTED_PROXIES
+
+        xff = request.headers.get("X-Forwarded-For")
+        if xff and trusted:
+            # X-Forwarded-For can contain multiple IPs: client, proxy1, proxy2
+            ips = [ip.strip() for ip in xff.split(",")]
+            # Walk from right to left, return the last untrusted IP
+            for ip in reversed(ips):
+                if not self._is_trusted_ip(ip, trusted):
+                    return ip
+            # All IPs are trusted, use the leftmost (original client)
+            return ips[0] if ips else request.remote or "unknown"
+        elif xff:
+            # No trusted proxies configured but XFF present -- use first IP
+            ips = [ip.strip() for ip in xff.split(",")]
+            if ips:
+                return ips[0]
+
+        return request.remote or "0.0.0.0"
+
+    @staticmethod
+    def _is_trusted_ip(ip: str, trusted_cidrs: Set[str]) -> bool:
+        """Check if IP is in a trusted CIDR range (simple prefix matching)."""
+        import ipaddress
+        try:
+            addr = ipaddress.ip_address(ip)
+            for cidr in trusted_cidrs:
+                try:
+                    if addr in ipaddress.ip_network(cidr, strict=False):
+                        return True
+                except ValueError:
+                    continue
+        except ValueError:
+            pass
+        return False
+
+    # ── Replay protection ─────────────────────────────────────────────────
+
+    def _is_replayed_random(self, random_val: str) -> bool:
+        """Check if this random value was already seen (replay attack prevention).
+
+        Evicts stale entries on each call for O(1) amortized cost.
+        """
+        now = time.monotonic()
+
+        # Evict stale entries
+        expired = [
+            k for k, ts in self._seen_randoms.items()
+            if now - ts > REPLAY_RANDOM_TTL_SECONDS
+        ]
+        for k in expired:
+            del self._seen_randoms[k]
+
+        if random_val in self._seen_randoms:
+            return True
+
+        self._seen_randoms[random_val] = now
+        return False
 
     # ── Signature verification ────────────────────────────────────────────
 
@@ -374,10 +538,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
           "actor": {"type": "Person", "id": "...", "name": "..."},
           "object": {
             "type": "Note", "id": "...",
-            "name": "...", "content": "...",
+            "name": "...", "content": "...",  <-- JSON-encoded dict per spec
             "mediaType": "..."
           },
-          "target": {"type": "Collection", "id": "...", "name": "..."}
+          "target": {"type": "Collection", "id": "<room_token>", "name": "<room_name>"}
         }
         """
         activity_type = data.get("type", "")
@@ -391,7 +555,13 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             return None
 
         obj = data.get("object", {})
-        message_text = (obj.get("content", "") or "").strip()
+
+        # ── C1 FIX: Parse object.content as JSON (per spec) ─────────────
+        # Per Nextcloud Talk Bot API spec, object.content is a JSON-encoded
+        # dictionary: {"message": "...", "parameters": {...}}
+        # Fall back to plain text if JSON parsing fails.
+        raw_content = obj.get("content", "") or ""
+        message_text = self._parse_content(raw_content)
         if not message_text:
             logger.debug("Empty message content, skipping")
             return None
@@ -399,28 +569,42 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         actor = data.get("actor", {})
         sender_id = str(actor.get("id", ""))
         sender_name = str(actor.get("name", "") or "")
-        # Strip trailing '-Bot' suffix (e.g. "MyBot-Bot" → "MyBot")
+        # Strip trailing '-Bot' suffix (e.g. "MyBot-Bot" -> "MyBot")
         # so sender auth matches the actual bot identity.
         if sender_name.endswith("-Bot"):
             sender_name = sender_name[:-4]
 
         target = data.get("target", {})
-        target_id = str(target.get("id", ""))
-        room_name = str(target.get("name", ""))
-        # Extract room token from URL path (e.g. ".../call/abc123")
-        if "call/" in target_id:
-            room_token = target_id.split("call/")[-1].split("?")[0]
+        # ── M2 FIX: target.id is the room token directly, not a URL ────
+        # Per spec: "target.id -- The token of the conversation"
+        room_token = str(target.get("id", "") or "").strip()
+        if not room_token:
+            logger.debug("No room token in target.id, skipping")
+            return None
+
+        # ── M1 FIX: Determine chat_type from target.type per spec ───────
+        # Per Nextcloud Talk Bot API spec, target.type indicates the room:
+        #   "Direct" = DM, "Group" = group chat, "OneToOne" = DM
+        # Fallback: check isGroupChat legacy field, then default to DM.
+        target_type = str(target.get("type", "") or "").lower()
+        if target_type in ("direct", "oneonone"):
+            chat_type = "dm"
+        elif target_type == "group":
+            chat_type = "group"
         else:
-            room_token = target_id
+            # Legacy fallback
+            is_group = data.get("isGroupChat", False)
+            chat_type = "group" if is_group else "dm"
+
+        room_name = str(target.get("name", "") or "")
 
         message_id = str(obj.get("id", ""))
-        is_group = data.get("isGroupChat", False)
 
         source = SessionSource(
             platform=Platform("nextcloud_talk"),
             chat_id=room_token,
             chat_name=room_name or room_token,
-            chat_type="group" if is_group else "dm",
+            chat_type=chat_type,
             user_id=sender_id,
             user_name=sender_name,
             thread_id=None,
@@ -433,6 +617,36 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             raw_message=data,
             message_id=message_id,
         )
+
+    @staticmethod
+    def _parse_content(raw_content: str) -> str:
+        """Parse object.content field.
+
+        Per spec, content is JSON-encoded: {"message": "...", "parameters": {...}}
+        Falls back to raw text if not valid JSON.
+        """
+        if not raw_content:
+            return ""
+
+        # Try JSON parsing first (per spec)
+        try:
+            content_obj = json.loads(raw_content)
+            if isinstance(content_obj, dict):
+                message = content_obj.get("message", "") or ""
+                params = content_obj.get("parameters", {})
+                if isinstance(params, dict) and message:
+                    # Render placeholders with actual display names
+                    for key, val in params.items():
+                        if isinstance(val, dict):
+                            display_name = val.get("displayName", "") or val.get("name", key)
+                            message = message.replace("{" + key + "}", str(display_name))
+                    return message.strip()
+                return message.strip()
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+
+        # Fallback: treat as plain text
+        return raw_content.strip()
 
     # ── Outbound: send response ───────────────────────────────────────────
 
@@ -451,12 +665,25 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         if not room_token:
             return SendResult(success=False, error="No room_token in chat_id")
 
+        # ── m5 FIX: Sanitize room_token for URL path ────────────────────
+        # Only allow safe token characters (alphanumeric, hyphen, underscore)
+        if not re.match(r'^[a-zA-Z0-9\-_]+$', room_token):
+            logger.warning("Unsafe room_token: %r, rejecting", room_token)
+            return SendResult(success=False, error="Invalid room_token")
+
         url = f"/ocs/v2.php/apps/spreed/api/v1/bot/{room_token}/message"
 
+        # ── m9 FIX: Enforce max message length ──────────────────────────
+        if len(content) > self._max_message_length:
+            logger.warning(
+                "Message truncated from %d to %d chars",
+                len(content), self._max_message_length,
+            )
+            content = content[:self._max_message_length]
+
         payload: Dict[str, Any] = {"message": content}
+        # ── C3 FIX: Convert replyTo to int (spec requires integer) ──────
         if reply_to:
-            # Nextcloud Talk Bot API expects replyTo as an integer message ID.
-            # Convert from string (gateway convention) to int.
             try:
                 payload["replyTo"] = int(reply_to)
             except (ValueError, TypeError):
@@ -478,13 +705,36 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 content=payload_body.encode("utf-8"),
                 headers={
                     "Content-Type": "application/json",
-                    RANDOM_HEADER: random_value,
-                    SIGNATURE_HEADER: signature,
+                    # ── C2 FIX: Use SEND-specific headers (-Bot- variant) ─
+                    SEND_RANDOM_HEADER: random_value,
+                    SEND_SIGNATURE_HEADER: signature,
                 },
             )
             if resp.status_code in (200, 201):
-                logger.debug("Sent message to room %s (reply_to=%s)", room_token, reply_to)
-                return SendResult(success=True)
+                # ── M8 FIX: Extract message_id from server response ──────
+                message_id = None
+                try:
+                    resp_data = resp.json()
+                    if isinstance(resp_data, dict):
+                        # Response wrapper: {"ocs":{"data":{"message":12345}}}
+                        ocs = resp_data.get("ocs", {})
+                        if isinstance(ocs, dict):
+                            data = ocs.get("data", {})
+                        else:
+                            data = ocs
+                        if isinstance(data, dict):
+                            message_id = str(data.get("message", ""))
+                        elif isinstance(data, int):
+                            message_id = str(data)
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
+
+                logger.debug(
+                    "Sent message to room %s (reply_to=%s, server_msg_id=%s)",
+                    room_token, reply_to, message_id,
+                )
+                return SendResult(success=True, message_id=message_id)
+
             logger.error("Nextcloud Talk send failed: %d %s", resp.status_code, resp.text[:200])
             return SendResult(success=False, error=f"HTTP {resp.status_code}")
         except Exception as exc:
@@ -498,17 +748,20 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         pass
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        """Return chat info. Type is unknown without a session lookup."""
+        """Return chat info.
+
+        Without a live session lookup, we can only return basic info.
+        """
         return {"name": chat_id, "type": "unknown"}
 
     def format_message(self, content: str) -> str:
-        """Nextcloud Talk supports rich text — pass through."""
+        """Nextcloud Talk supports rich text -- pass through."""
         return content
 
     # ── Health check ──────────────────────────────────────────────────────
 
     async def _handle_health(self, request: web.Request) -> web.Response:
-        """Health check endpoint — OpenClaw-compatible /healthz."""
+        """Health check endpoint -- OpenClaw-compatible /healthz."""
         return _json_response(200, {"status": "healthy"})
 
     # ── Rate limiting ─────────────────────────────────────────────────────
@@ -632,6 +885,10 @@ async def _standalone_send(
     if not base_url or not bot_secret or not room_token:
         return {"error": "Missing NEXTCLOUD_TALK_BASE_URL, BOT_SECRET, or chat_id"}
 
+    # Sanitize room_token for URL path
+    if not re.match(r'^[a-zA-Z0-9\-_]+$', room_token):
+        return {"error": f"Invalid room_token: {room_token!r}"}
+
     url = (
         f"{base_url.rstrip('/')}/ocs/v2.php/apps/spreed/api/v1/bot/"
         f"{room_token}/message"
@@ -655,12 +912,29 @@ async def _standalone_send(
                 headers={
                     "OCS-ApiRequest": "true",
                     "Content-Type": "application/json",
-                    RANDOM_HEADER: random_value,
-                    SIGNATURE_HEADER: signature,
+                    # ── C2 FIX: Use SEND-specific headers ────────────
+                    SEND_RANDOM_HEADER: random_value,
+                    SEND_SIGNATURE_HEADER: signature,
                 },
             )
             if resp.status_code in (200, 201):
-                return {"success": True, "message_id": str(int(time.time() * 1000))}
+                # ── m4 FIX: Extract real message_id from response ────
+                message_id = None
+                try:
+                    resp_data = resp.json()
+                    if isinstance(resp_data, dict):
+                        ocs = resp_data.get("ocs", {})
+                        if isinstance(ocs, dict):
+                            data = ocs.get("data", {})
+                        else:
+                            data = ocs
+                        if isinstance(data, dict):
+                            message_id = str(data.get("message", ""))
+                        elif isinstance(data, int):
+                            message_id = str(data)
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
+                return {"success": True, "message_id": message_id}
             return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
     except Exception as exc:
         return {"error": str(exc)}
@@ -669,7 +943,7 @@ async def _standalone_send(
 # ── Plugin registration ──────────────────────────────────────────────────
 
 def register(ctx) -> None:
-    """Plugin entry point — called by the Hermes plugin system."""
+    """Plugin entry point -- called by the Hermes plugin system."""
 
     def _env_enablement() -> dict | None:
         base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
@@ -695,4 +969,5 @@ def register(ctx) -> None:
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="NEXTCLOUD_TALK_HOME_CHANNEL",
         platform_hint="You are communicating via Nextcloud Talk. Use plain text or simple formatting.",
+        max_message_length=getattr(NextcloudTalkAdapter, '_max_message_length', DEFAULT_MAX_MESSAGE_LENGTH),
     )

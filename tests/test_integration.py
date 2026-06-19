@@ -217,13 +217,20 @@ class TestWebhookFullFlow:
             assert resp1.status == 200
             assert (await resp1.json())["status"] == "accepted"
 
-            # Second request with same signature
+            # Second request with same message but DIFFERENT random value
+            # (tests message_id dedup, not replay protection)
+            random_val2 = secrets.token_hex(16)
+            sig2 = hmac.new(
+                b"test-secret",
+                (random_val2 + body).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
             resp2 = await client.post(
                 adapter._path,
                 data=body,
                 headers={
-                    SIGNATURE_HEADER: sig,
-                    RANDOM_HEADER: random_val,
+                    SIGNATURE_HEADER: sig2,
+                    RANDOM_HEADER: random_val2,
                 },
             )
             assert resp2.status == 200
