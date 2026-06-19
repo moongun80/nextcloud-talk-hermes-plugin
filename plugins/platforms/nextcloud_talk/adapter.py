@@ -278,10 +278,28 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
             self._clear_failed_attempts(client_ip)
 
-            data = json.loads(body)
-            msg_event = self._parse_message(data)
-            if not msg_event:
-                return _json_response(200, {"status": "ok"})
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                # Nextcloud may send plain-text body (not JSON-wrapped).
+                # Treat the raw body as message content and fabricate a
+                # minimal MessageEvent so the bot can still process it.
+                plain_text = body.strip()
+                if not plain_text:
+                    return _json_response(200, {"status": "ok"})
+                msg_event = self._parse_message({
+                    "type": "Create",
+                    "actor": {"type": "Person", "id": "unknown", "name": "anonymous"},
+                    "object": {"type": "Note", "id": f"plain-{int(time.time()*1000)}", "content": plain_text},
+                    "target": {"type": "Collection", "id": "unknown", "name": "unknown"},
+                    "isGroupChat": False,
+                })
+                if not msg_event:
+                    return _json_response(200, {"status": "ok"})
+            else:
+                msg_event = self._parse_message(data)
+                if not msg_event:
+                    return _json_response(200, {"status": "ok"})
 
             if not self._check_permissions(msg_event):
                 return _json_response(200, {"status": "permission_denied"})
@@ -380,7 +398,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         actor = data.get("actor", {})
         sender_id = str(actor.get("id", ""))
-        sender_name = str(actor.get("name", ""))
+        sender_name = str(actor.get("name", "") or "")
+        # Strip trailing '-Bot' suffix (e.g. "MyBot-Bot" → "MyBot")
+        # so sender auth matches the actual bot identity.
+        if sender_name.endswith("-Bot"):
+            sender_name = sender_name[:-4]
 
         target = data.get("target", {})
         target_id = str(target.get("id", ""))
@@ -433,7 +455,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         payload: Dict[str, Any] = {"message": content}
         if reply_to:
-            payload["replyTo"] = reply_to
+            # Nextcloud Talk Bot API expects replyTo as an integer message ID.
+            # Convert from string (gateway convention) to int.
+            try:
+                payload["replyTo"] = int(reply_to)
+            except (ValueError, TypeError):
+                logger.warning("Invalid reply_to value: %r, sending without reply", reply_to)
 
         payload_body = json.dumps(payload)
 

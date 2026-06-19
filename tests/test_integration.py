@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -285,3 +286,62 @@ class TestConnectValidation:
         ):
             result = await adapter.connect()
             assert result is False
+
+
+# ── C1: Plain-text body handling tests ─────────────────────────────────────
+
+class TestPlainTextBody:
+    """Tests for plain-text webhook body handling (C1 fix)."""
+
+    @pytest.mark.asyncio
+    async def test_plain_text_body_accepted(self, adapter):
+        """Plain-text body should be treated as message content."""
+        app = _build_app(adapter)
+        async with TestClient(TestServer(app)) as client:
+            body = "Hello from plain text!"
+            # Sign the ACTUAL body (plain text), not a JSON payload
+            random_val = secrets.token_hex(16)
+            import hashlib, hmac
+            sig = hmac.new(
+                b"test-secret",
+                (random_val + body).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            resp = await client.post(
+                adapter._path,
+                data=body,
+                headers={
+                    SIGNATURE_HEADER: sig,
+                    RANDOM_HEADER: random_val,
+                },
+            )
+            # Should NOT return 400 Bad JSON — instead processes as plain text
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "accepted"
+
+    @pytest.mark.asyncio
+    async def test_empty_plain_text_body_returns_ok(self, adapter):
+        """Empty plain-text body should return ok (no event)."""
+        app = _build_app(adapter)
+        async with TestClient(TestServer(app)) as client:
+            body = "   "
+            # Sign the actual body
+            random_val = secrets.token_hex(16)
+            import hashlib, hmac
+            sig = hmac.new(
+                b"test-secret",
+                (random_val + body).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            resp = await client.post(
+                adapter._path,
+                data=body,
+                headers={
+                    SIGNATURE_HEADER: sig,
+                    RANDOM_HEADER: random_val,
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ok"

@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 import sys
 import time
+import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
 
@@ -482,3 +483,117 @@ class TestPermissionPolicies:
             NEXTCLOUD_TALK_DM_POLICY="restricted",
         )
         assert adapter._dm_policy == "restricted"
+
+
+# ── C2: -Bot suffix stripping tests ────────────────────────────────────────
+
+class TestBotSuffixStripping:
+    """Tests for sender name -Bot suffix removal."""
+
+    def test_bot_suffix_stripped(self, sample_create_payload):
+        """Sender name ending in '-Bot' should be stripped."""
+        adapter = _make_adapter()
+        payload = dict(sample_create_payload)
+        payload["actor"]["name"] = "MyBot-Bot"
+        event = adapter._parse_message(payload)
+        assert event is not None
+        assert event.source.user_name == "MyBot"
+
+    def test_no_suffix_unchanged(self, sample_create_payload):
+        """Sender name without -Bot suffix should be unchanged."""
+        adapter = _make_adapter()
+        payload = dict(sample_create_payload)
+        payload["actor"]["name"] = "RegularUser"
+        event = adapter._parse_message(payload)
+        assert event is not None
+        assert event.source.user_name == "RegularUser"
+
+    def test_empty_name_no_crash(self):
+        """Empty sender name should not crash."""
+        adapter = _make_adapter()
+        event = adapter._parse_message({
+            "type": "Create",
+            "actor": {"type": "Person", "id": "u1", "name": ""},
+            "object": {"type": "Note", "id": "m1", "content": "hi"},
+            "target": {"type": "Collection", "id": "r1", "name": "r1"},
+            "isGroupChat": False,
+        })
+        assert event is not None
+        assert event.source.user_name == ""
+
+    def test_none_name_no_crash(self):
+        """None sender name should not crash."""
+        adapter = _make_adapter()
+        event = adapter._parse_message({
+            "type": "Create",
+            "actor": {"type": "Person", "id": "u1", "name": None},
+            "object": {"type": "Note", "id": "m1", "content": "hi"},
+            "target": {"type": "Collection", "id": "r1", "name": "r1"},
+            "isGroupChat": False,
+        })
+        assert event is not None
+        assert event.source.user_name == ""
+
+
+# ── C3: replyTo integer conversion tests ───────────────────────────────────
+
+class TestReplyToIntConversion:
+    """Tests for replyTo integer conversion in send()."""
+
+    @pytest.mark.asyncio
+    async def test_replyto_string_converted_to_int(self):
+        """String reply_to should be converted to int in payload."""
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._running = True
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_post = AsyncMock(return_value=mock_resp)
+        with patch.object(adapter._http_client, 'post', mock_post):
+            result = await adapter.send("room-abc", "Hello", reply_to="12345")
+            assert result.success is True
+
+            # Verify the payload had replyTo as int
+            call_kwargs = mock_post.call_args.kwargs
+            payload_body = call_kwargs["content"].decode("utf-8")
+            payload = json.loads(payload_body)
+            assert "replyTo" in payload
+            assert isinstance(payload["replyTo"], int)
+            assert payload["replyTo"] == 12345
+
+    @pytest.mark.asyncio
+    async def test_replyto_invalid_string_logged(self):
+        """Non-numeric reply_to should be logged and omitted."""
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._running = True
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_post = AsyncMock(return_value=mock_resp)
+        with patch.object(adapter._http_client, 'post', mock_post):
+            result = await adapter.send("room-abc", "Hello", reply_to="not-a-number")
+            assert result.success is True
+
+            payload_body = mock_post.call_args.kwargs["content"].decode("utf-8")
+            payload = json.loads(payload_body)
+            assert "replyTo" not in payload
+
+    @pytest.mark.asyncio
+    async def test_no_replyto_unchanged(self):
+        """No reply_to should not add replyTo to payload."""
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._running = True
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_post = AsyncMock(return_value=mock_resp)
+        with patch.object(adapter._http_client, 'post', mock_post):
+            result = await adapter.send("room-abc", "Hello")
+            assert result.success is True
+
+            payload_body = mock_post.call_args.kwargs["content"].decode("utf-8")
+            payload = json.loads(payload_body)
+            assert "replyTo" not in payload
