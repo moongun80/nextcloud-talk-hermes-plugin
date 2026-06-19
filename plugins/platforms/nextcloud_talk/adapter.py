@@ -177,7 +177,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     """
 
     supports_code_blocks: bool = True
-    _max_message_length: int = int(os.getenv("NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH", "65536"))
 
     def __init__(self, config, **kwargs):
         platform = Platform("nextcloud_talk")
@@ -947,7 +946,4 @@ def register(ctx) -> None:
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="NEXTCLOUD_TALK_HOME_CHANNEL",
         platform_hint="You are communicating via Nextcloud Talk. Use plain text or simple formatting.",
-        max_message_length=int(
-            os.getenv("NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH", DEFAULT_MAX_MESSAGE_LENGTH)
-        ),
     )
