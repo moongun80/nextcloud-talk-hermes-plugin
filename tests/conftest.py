@@ -20,6 +20,14 @@ if HERMES_GATEWAY not in sys.path:
     sys.path.append(HERMES_GATEWAY)
 
 
+def pytest_configure(config):
+    """Ensure sys.path is set before any imports."""
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+    if HERMES_GATEWAY not in sys.path:
+        sys.path.append(HERMES_GATEWAY)
+
+
 # ── Fake config object ────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -28,7 +36,6 @@ def fake_config():
     config = MagicMock()
     config.extra = {
         "base_url": "https://nc.example.com",
-        "bot_token": "test-token",
         "bot_secret": "test-secret",
         "host": "127.0.0.1",
         "port": 9999,

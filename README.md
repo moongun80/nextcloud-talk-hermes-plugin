@@ -39,7 +39,6 @@ gateway:
       enabled: true
       extra:
         base_url: "https://your-nextcloud.example.com"
-        bot_token: "your-bot-access-token"
         bot_secret: "your-bot-secret"
         host: "0.0.0.0"
         port: 8745
@@ -55,7 +54,6 @@ Or via environment variables (config.yaml takes precedence):
 
 ```bash
 export NEXTCLOUD_TALK_BASE_URL=https://your-nextcloud.example.com
-export NEXTCLOUD_TALK_BOT_TOKEN=your-bot-token
 export NEXTCLOUD_TALK_BOT_SECRET=your-bot-secret
 export NEXTCLOUD_TALK_PORT=8745
 export NEXTCLOUD_TALK_PATH=/nextcloud-talk/callback
@@ -82,7 +80,7 @@ export NEXTCLOUD_TALK_ALLOWED_DM_USERS=user1,user2
 2. Go to **Settings → Bot**
 3. Click **Create Bot**
 4. Set bot name (e.g., "Hermes Agent")
-5. Copy **Access Token** and **HMAC Secret** — needed for configuration
+5. Copy **HMAC Secret** — needed for configuration
 
 ## API Endpoints
 

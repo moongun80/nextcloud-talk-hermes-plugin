@@ -4,6 +4,10 @@ Receives chat messages via HTTP POST webhook (ActivityPub-style payloads),
 verifies HMAC-SHA256 signatures, and sends responses back via the Talk
 Bot API.
 
+Authentication is HMAC-SHA256 signature-based only — no bot token concept.
+Receiving (NC → bot): server signs with secret → bot verifies.
+Sending (bot → NC): bot signs with secret → server verifies.
+
 Thin protocol bridge — session management, message routing, and background
 task lifecycle are handled by BasePlatformAdapter.
 
@@ -15,7 +19,6 @@ Configuration in config.yaml::
           enabled: true
           extra:
             base_url: "https://your-nextcloud.example.com"
-            bot_token: "your-bot-token"
             bot_secret: "your-bot-secret"
             host: "0.0.0.0"
             port: 8745
@@ -23,7 +26,7 @@ Configuration in config.yaml::
 
 Or via environment variables (overrides config.yaml)::
 
-    NEXTCLOUD_TALK_BASE_URL, NEXTCLOUD_TALK_BOT_TOKEN, NEXTCLOUD_TALK_BOT_SECRET,
+    NEXTCLOUD_TALK_BASE_URL, NEXTCLOUD_TALK_BOT_SECRET,
     NEXTCLOUD_TALK_HOST, NEXTCLOUD_TALK_PORT, NEXTCLOUD_TALK_PATH,
     NEXTCLOUD_TALK_ALLOWED_USERS, NEXTCLOUD_TALK_GROUP_POLICY,
     NEXTCLOUD_TALK_DM_POLICY, NEXTCLOUD_TALK_ALLOWED_DM_USERS
@@ -87,10 +90,9 @@ RATE_LIMIT_BLOCK_SECONDS = 1800    # 30 minutes block duration
 
 def check_requirements() -> bool:
     """Return True if the Nextcloud Talk adapter can be used."""
-    token = os.getenv("NEXTCLOUD_TALK_BOT_TOKEN", "")
     secret = os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
     base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
-    if not token or not secret or not base_url:
+    if not secret or not base_url:
         logger.debug("Nextcloud Talk: required env vars not set")
         return False
     if not AIOHTTP_AVAILABLE or not HTTPX_AVAILABLE:
@@ -103,9 +105,8 @@ def validate_config(config) -> bool:
     """Validate that the platform config has required fields."""
     extra = getattr(config, "extra", {}) or {}
     base_url = extra.get("base_url", "") or os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
-    bot_token = extra.get("bot_token", "") or os.getenv("NEXTCLOUD_TALK_BOT_TOKEN", "")
     bot_secret = extra.get("bot_secret", "") or os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
-    return bool(base_url and bot_token and bot_secret)
+    return bool(base_url and bot_secret)
 
 
 # ── Adapter ───────────────────────────────────────────────────────────────
@@ -137,9 +138,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         )
         self._base_url = str(
             extra.get("base_url", "") or os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
-        )
-        self._bot_token = str(
-            extra.get("bot_token", "") or os.getenv("NEXTCLOUD_TALK_BOT_TOKEN", "")
         )
         self._bot_secret = str(
             extra.get("bot_secret", "") or os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
@@ -200,9 +198,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             logger.error("nextcloud_talk requires aiohttp and httpx")
             return False
 
-        if not self._base_url or not self._bot_token or not self._bot_secret:
+        if not self._base_url or not self._bot_secret:
             logger.error(
-                "nextcloud_talk requires base_url, bot_token, and bot_secret"
+                "nextcloud_talk requires base_url and bot_secret",
             )
             return False
 
@@ -230,7 +228,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             base_url=self._base_url.rstrip("/"),
             timeout=httpx.Timeout(30.0),
             headers={
-                "Authorization": f"Bearer {self._bot_token}",
                 "OCS-ApiRequest": "true",
             },
         )
@@ -598,18 +595,14 @@ async def _standalone_send(
         pconfig.extra.get("base_url", "")
         or os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
     )
-    bot_token = (
-        pconfig.extra.get("bot_token", "")
-        or os.getenv("NEXTCLOUD_TALK_BOT_TOKEN", "")
-    )
     bot_secret = (
         pconfig.extra.get("bot_secret", "")
         or os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
     )
     room_token = chat_id
 
-    if not base_url or not bot_token or not bot_secret or not room_token:
-        return {"error": "Missing NEXTCLOUD_TALK_BASE_URL, BOT_TOKEN, BOT_SECRET, or chat_id"}
+    if not base_url or not bot_secret or not room_token:
+        return {"error": "Missing NEXTCLOUD_TALK_BASE_URL, BOT_SECRET, or chat_id"}
 
     url = (
         f"{base_url.rstrip('/')}/ocs/v2.php/apps/spreed/api/v1/bot/"
@@ -632,7 +625,6 @@ async def _standalone_send(
                 url,
                 content=payload_body.encode("utf-8"),
                 headers={
-                    "Authorization": f"Bearer {bot_token}",
                     "OCS-ApiRequest": "true",
                     "Content-Type": "application/json",
                     RANDOM_HEADER: random_value,
@@ -653,10 +645,9 @@ def register(ctx) -> None:
 
     def _env_enablement() -> dict | None:
         base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
-        bot_token = os.getenv("NEXTCLOUD_TALK_BOT_TOKEN", "")
         bot_secret = os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
-        if base_url and bot_token and bot_secret:
-            return {"extra": {"base_url": base_url, "bot_token": bot_token, "bot_secret": bot_secret}}
+        if base_url and bot_secret:
+            return {"extra": {"base_url": base_url, "bot_secret": bot_secret}}
         return None
 
     ctx.register_platform(
@@ -667,7 +658,6 @@ def register(ctx) -> None:
         validate_config=validate_config,
         required_env=[
             "NEXTCLOUD_TALK_BASE_URL",
-            "NEXTCLOUD_TALK_BOT_TOKEN",
             "NEXTCLOUD_TALK_BOT_SECRET",
         ],
         install_hint="pip install aiohttp httpx",

@@ -14,11 +14,11 @@ import pytest
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-# Remove hermes-agent path if present — we want project's adapter.py, not hers
+
+# Add the Hermes gateway so gateway imports resolve
 HERMES_GATEWAY = os.path.expanduser("~/.hermes/hermes-agent")
-if HERMES_GATEWAY in sys.path:
-    sys.path.remove(HERMES_GATEWAY)
-    sys.path.insert(0, PROJECT_ROOT)  # re-insert project root at front
+if HERMES_GATEWAY not in sys.path:
+    sys.path.append(HERMES_GATEWAY)
 
 from plugins.platforms.nextcloud_talk.adapter import (
     NextcloudTalkAdapter,

@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -19,6 +20,11 @@ import pytest
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+# Add the Hermes gateway so gateway imports resolve
+HERMES_GATEWAY = os.path.expanduser("~/.hermes/hermes-agent")
+if HERMES_GATEWAY not in sys.path:
+    sys.path.append(HERMES_GATEWAY)
 
 from plugins.platforms.nextcloud_talk.adapter import (
     NextcloudTalkAdapter,
@@ -50,18 +56,17 @@ def _sign(payload: dict, secret: str):
 def _make_test_adapter(extra: dict | None = None) -> NextcloudTalkAdapter:
     """Create a minimal adapter for testing."""
     os.environ["NEXTCLOUD_TALK_BASE_URL"] = "https://nc.example.com"
-    os.environ["NEXTCLOUD_TALK_BOT_TOKEN"] = "test-token"
     os.environ["NEXTCLOUD_TALK_BOT_SECRET"] = "test-secret"
 
-    config = MagicMock()
-    config.extra = extra or {
+    config_extra = extra or {
         "base_url": "https://nc.example.com",
-        "bot_token": "test-token",
         "bot_secret": "test-secret",
         "host": "127.0.0.1",
         "port": 9999,
         "path": "/test-callback",
     }
+
+    config = SimpleNamespace(extra=config_extra)
 
     adapter = NextcloudTalkAdapter(config)
     return adapter

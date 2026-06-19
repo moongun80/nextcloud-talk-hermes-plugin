@@ -39,7 +39,6 @@ gateway:
       enabled: true
       extra:
         base_url: "https://your-nextcloud.example.com"
-        bot_token: "your-bot-access-token"
         bot_secret: "your-bot-secret"
         host: "0.0.0.0"
         port: 8745
@@ -55,7 +54,6 @@ gateway:
 
 ```bash
 export NEXTCLOUD_TALK_BASE_URL=https://your-nextcloud.example.com
-export NEXTCLOUD_TALK_BOT_TOKEN=your-bot-token
 export NEXTCLOUD_TALK_BOT_SECRET=your-bot-secret
 export NEXTCLOUD_TALK_PORT=8745
 export NEXTCLOUD_TALK_PATH=/nextcloud-talk/callback
@@ -80,7 +78,7 @@ export NEXTCLOUD_TALK_ALLOWED_DM_USERS=user1,user2
 
 1. Nextcloud Talk 대시보드에서 Bot 설정
 2. Webhook URL: `http://<서버 IP>:8745/nextcloud-talk/callback`
-3. Bot Access Token 및 HMAC Secret 발급
+3. HMAC Secret 발급
 
 ## API 엔드포인트
 
