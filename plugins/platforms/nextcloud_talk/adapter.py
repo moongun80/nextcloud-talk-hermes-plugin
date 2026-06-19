@@ -384,6 +384,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         target = data.get("target", {})
         target_id = str(target.get("id", ""))
+        room_name = str(target.get("name", ""))
         # Extract room token from URL path (e.g. ".../call/abc123")
         if "call/" in target_id:
             room_token = target_id.split("call/")[-1].split("?")[0]
@@ -396,7 +397,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         source = SessionSource(
             platform=Platform("nextcloud_talk"),
             chat_id=room_token,
-            chat_name=room_token,
+            chat_name=room_name or room_token,
             chat_type="group" if is_group else "dm",
             user_id=sender_id,
             user_name=sender_name,

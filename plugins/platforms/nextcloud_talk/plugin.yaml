@@ -3,36 +3,29 @@ label: Nextcloud Talk
 kind: platform
 version: 1.0.0
 description: >
-  Nextcloud Talk webhook adapter for Hermes Agent.
-  Receives chat messages via HTTP POST webhook with HMAC-SHA256
-  signature verification, and sends responses via the Nextcloud
-  Talk Bot API.
-author: Nous Research
+  Nextcloud Talk webhook adapter for Hermes Agent. Uses HMAC-SHA256 signature verification for authentication.
+author: moongun80
 requires_env:
   - name: NEXTCLOUD_TALK_BASE_URL
-    description: "Nextcloud server URL (e.g. https://nc.example.com)"
-    prompt: "Nextcloud URL"
+    description: "Nextcloud instance URL (e.g., https://nc.example.com)"
+    prompt: "Nextcloud Base URL"
     password: false
-  - name: NEXTCLOUD_TALK_BOT_TOKEN
-    description: "Bot account token"
-    prompt: "Bot token"
-    password: true
   - name: NEXTCLOUD_TALK_BOT_SECRET
-    description: "Bot secret for HMAC signature verification"
-    prompt: "Bot secret"
+    description: "HMAC secret from Nextcloud Bot settings"
+    prompt: "Bot HMAC Secret"
     password: true
 optional_env:
   - name: NEXTCLOUD_TALK_HOST
     description: "Webhook listen host (default: 0.0.0.0)"
-    prompt: "Webhook host"
+    prompt: "Listen host"
     password: false
   - name: NEXTCLOUD_TALK_PORT
     description: "Webhook listen port (default: 8745)"
-    prompt: "Webhook port"
+    prompt: "Listen port"
     password: false
   - name: NEXTCLOUD_TALK_PATH
     description: "Webhook callback path (default: /nextcloud-talk/callback)"
-    prompt: "Webhook path"
+    prompt: "Callback path"
     password: false
   - name: NEXTCLOUD_TALK_ALLOWED_USERS
     description: "Comma-separated list of allowed user IDs for group chats (when group_policy=members)"

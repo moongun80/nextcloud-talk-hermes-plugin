@@ -248,7 +248,6 @@ class TestConnectValidation:
         config = MagicMock()
         config.extra = {
             "base_url": "https://nc.example.com",
-            "bot_token": "token",
             "bot_secret": "secret",
             "port": 99999,  # Invalid
         }
@@ -262,7 +261,6 @@ class TestConnectValidation:
         config = MagicMock()
         config.extra = {
             "base_url": "ftp://nc.example.com",  # Not http/https
-            "bot_token": "token",
             "bot_secret": "secret",
             "port": 8745,
         }
@@ -276,7 +274,6 @@ class TestConnectValidation:
         config = MagicMock()
         config.extra = {
             "base_url": "https://nc.example.com",
-            "bot_token": "token",
             "bot_secret": "secret",
             "port": 8745,
         }
