@@ -74,10 +74,11 @@ def _make_adapter(extra: dict | None = None, **env_overrides) -> NextcloudTalkAd
 @pytest.fixture(autouse=True)
 def _reset_trusted_proxies():
     """Reset _DEFAULT_TRUSTED_PROXIES before each test."""
-    global _DEFAULT_TRUSTED_PROXIES
-    _DEFAULT_TRUSTED_PROXIES = set()
+    import plugins.platforms.nextcloud_talk.adapter as adapter_mod
+    adapter_mod._DEFAULT_TRUSTED_PROXIES = set()
     yield
-    _DEFAULT_TRUSTED_PROXIES = set()
+    import plugins.platforms.nextcloud_talk.adapter as adapter_mod
+    adapter_mod._DEFAULT_TRUSTED_PROXIES = set()
 
 
 @pytest.fixture(autouse=True)
@@ -472,8 +473,8 @@ class TestM5XForwardedFor:
 
     def test_trusted_proxy_chain(self):
         """With trusted proxies, should use last untrusted IP."""
-        global _DEFAULT_TRUSTED_PROXIES
-        _DEFAULT_TRUSTED_PROXIES = {"10.0.0.0/8"}
+        import plugins.platforms.nextcloud_talk.adapter as adapter_mod
+        adapter_mod._DEFAULT_TRUSTED_PROXIES = {"10.0.0.0/8"}
 
         adapter = _make_adapter()
         mock_request = MagicMock()
@@ -485,10 +486,10 @@ class TestM5XForwardedFor:
         # 203.0.113.50 is untrusted, 10.0.0.1 is trusted
         assert adapter._get_client_ip(mock_request) == "203.0.113.50"
 
-    def test_no_trusted_proxies_uses_xff_first(self):
-        """Without trusted proxies, XFF first IP is used."""
-        global _DEFAULT_TRUSTED_PROXIES
-        _DEFAULT_TRUSTED_PROXIES = set()
+    def test_no_trusted_proxies_ignores_xff(self):
+        """Without trusted proxies, XFF must be ignored to prevent spoofing."""
+        import plugins.platforms.nextcloud_talk.adapter as adapter_mod
+        adapter_mod._DEFAULT_TRUSTED_PROXIES = set()
 
         adapter = _make_adapter()
         mock_request = MagicMock()
@@ -497,7 +498,22 @@ class TestM5XForwardedFor:
             "X-Forwarded-For": "203.0.113.50, 10.0.0.1"
         }.get(key, default)
 
-        assert adapter._get_client_ip(mock_request) == "203.0.113.50"
+        # XFF must be ignored; should return request.remote
+        assert adapter._get_client_ip(mock_request) == "10.0.0.1"
+
+    def test_no_trusted_proxies_xff_with_no_remote(self):
+        """Without trusted proxies and no remote, return 0.0.0.0."""
+        import plugins.platforms.nextcloud_talk.adapter as adapter_mod
+        adapter_mod._DEFAULT_TRUSTED_PROXIES = set()
+
+        adapter = _make_adapter()
+        mock_request = MagicMock()
+        mock_request.remote = None
+        mock_request.headers.get.side_effect = lambda key, default=None: {
+            "X-Forwarded-For": "203.0.113.50"
+        }.get(key, default)
+
+        assert adapter._get_client_ip(mock_request) == "0.0.0.0"
 
     def test_unknown_remote_fallback(self):
         """When remote is None and no XFF, should return 0.0.0.0."""
@@ -721,3 +737,34 @@ class TestCheckRequirementsIntegration:
             "bot_secret": "config-secret",
         }, NEXTCLOUD_TALK_BASE_URL="https://env.example.com")
         assert check_requirements() is True
+# ── B2: register() max_message_length propagation ─────────────────────────
+
+class TestB2RegisterMaxMessageLength:
+    """Tests for B2: register() propagates configured max_message_length."""
+
+    def test_register_uses_default_max_message_length(self):
+        """register() must pass DEFAULT_MAX_MESSAGE_LENGTH when env is unset."""
+        # Ensure env var is unset
+        os.environ.pop("NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH", None)
+
+        mock_ctx = MagicMock()
+        from plugins.platforms.nextcloud_talk.adapter import register
+
+        register(mock_ctx)
+
+        call_kwargs = mock_ctx.register_platform.call_args.kwargs
+        assert call_kwargs["max_message_length"] == 32000
+
+    def test_register_propagates_custom_max_message_length(self):
+        """register() must propagate NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH from env."""
+        os.environ["NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH"] = "5000"
+        try:
+            mock_ctx = MagicMock()
+            from plugins.platforms.nextcloud_talk.adapter import register
+
+            register(mock_ctx)
+
+            call_kwargs = mock_ctx.register_platform.call_args.kwargs
+            assert call_kwargs["max_message_length"] == 5000
+        finally:
+            os.environ.pop("NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH", None)

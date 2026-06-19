@@ -377,22 +377,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._clear_failed_attempts(client_ip)
 
             # ── Parse payload ───────────────────────────────────────────
-            # object.content is JSON-encoded per spec, but handle plain-text
-            # gracefully (some clients may send raw bodies).
             try:
                 data = json.loads(body)
             except json.JSONDecodeError:
-                # Plain-text body: fabricate a minimal MessageEvent
-                plain_text = body.strip()
-                if not plain_text:
-                    return _json_response(200, {"status": "ok"})
-                logger.warning("Received non-JSON webhook body, treating as plain text")
-                data = {
-                    "type": "Create",
-                    "actor": {"type": "Person", "id": "unknown", "name": "anonymous"},
-                    "object": {"type": "Note", "id": f"plain-{int(time.time()*1000)}", "content": plain_text},
-                    "target": {"type": "Collection", "id": "unknown", "name": "unknown"},
-                }
+                logger.error("Received non-JSON webhook body (expected ActivityPub JSON)")
+                return _json_response(400, {"error": "Body must be valid JSON"})
 
             msg_event = self._parse_message(data)
             if not msg_event:
@@ -410,9 +399,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             await self.handle_message(msg_event)
             return _json_response(200, {"status": "accepted"})
 
-        except json.JSONDecodeError:
-            logger.exception("Failed to parse Nextcloud webhook body")
-            return _json_response(400, {"error": "Bad JSON"})
         except Exception:
             logger.exception("Error handling Nextcloud webhook")
             return _json_response(500, {"error": "Internal error"})
@@ -437,11 +423,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     return ip
             # All IPs are trusted, use the leftmost (original client)
             return ips[0] if ips else request.remote or "unknown"
-        elif xff:
-            # No trusted proxies configured but XFF present -- use first IP
-            ips = [ip.strip() for ip in xff.split(",")]
-            if ips:
-                return ips[0]
+        # No trusted proxies configured: ignore XFF to prevent spoofing.
+        # When no trusted proxies are set, XFF is untrustworthy -- any client
+        # can forge it to bypass rate limits and IP blocks.
 
         return request.remote or "0.0.0.0"
 
@@ -969,5 +953,7 @@ def register(ctx) -> None:
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="NEXTCLOUD_TALK_HOME_CHANNEL",
         platform_hint="You are communicating via Nextcloud Talk. Use plain text or simple formatting.",
-        max_message_length=getattr(NextcloudTalkAdapter, '_max_message_length', DEFAULT_MAX_MESSAGE_LENGTH),
+        max_message_length=int(
+            os.getenv("NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH", DEFAULT_MAX_MESSAGE_LENGTH)
+        ),
     )

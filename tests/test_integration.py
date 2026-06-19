@@ -295,18 +295,17 @@ class TestConnectValidation:
             assert result is False
 
 
-# ── C1: Plain-text body handling tests ─────────────────────────────────────
+# ── C1: Non-JSON body rejection tests (B6 fix) ─────────────────────────────
 
-class TestPlainTextBody:
-    """Tests for plain-text webhook body handling (C1 fix)."""
+class TestNonJsonBody:
+    """Tests for non-JSON webhook body rejection (B6 fix)."""
 
     @pytest.mark.asyncio
-    async def test_plain_text_body_accepted(self, adapter):
-        """Plain-text body should be treated as message content."""
+    async def test_plain_text_body_rejected(self, adapter):
+        """Non-JSON body should be rejected with 400."""
         app = _build_app(adapter)
         async with TestClient(TestServer(app)) as client:
             body = "Hello from plain text!"
-            # Sign the ACTUAL body (plain text), not a JSON payload
             random_val = secrets.token_hex(16)
             import hashlib, hmac
             sig = hmac.new(
@@ -322,18 +321,16 @@ class TestPlainTextBody:
                     RANDOM_HEADER: random_val,
                 },
             )
-            # Should NOT return 400 Bad JSON — instead processes as plain text
-            assert resp.status == 200
+            assert resp.status == 400
             data = await resp.json()
-            assert data["status"] == "accepted"
+            assert data["error"] == "Body must be valid JSON"
 
     @pytest.mark.asyncio
-    async def test_empty_plain_text_body_returns_ok(self, adapter):
-        """Empty plain-text body should return ok (no event)."""
+    async def test_empty_non_json_body_rejected(self, adapter):
+        """Empty non-JSON body should be rejected with 400."""
         app = _build_app(adapter)
         async with TestClient(TestServer(app)) as client:
             body = "   "
-            # Sign the actual body
             random_val = secrets.token_hex(16)
             import hashlib, hmac
             sig = hmac.new(
@@ -349,6 +346,4 @@ class TestPlainTextBody:
                     RANDOM_HEADER: random_val,
                 },
             )
-            assert resp.status == 200
-            data = await resp.json()
-            assert data["status"] == "ok"
+            assert resp.status == 400
