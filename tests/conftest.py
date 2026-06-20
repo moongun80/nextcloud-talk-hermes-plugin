@@ -71,7 +71,7 @@ def sample_create_payload():
             "content": "Hello from Nextcloud!",
             "mediaType": "text/plain",
         },
-        "target": {"type": "Collection", "id": "room-token-abc", "name": "room-token-abc"},
+        "target": {"type": "Collection", "id": "roomtokenabc", "name": "roomtokenabc"},
         "isGroupChat": False,
     }
 
@@ -89,7 +89,7 @@ def sample_group_payload():
             "content": "Group message here",
             "mediaType": "text/plain",
         },
-        "target": {"type": "Collection", "id": "group-room-xyz", "name": "group-room-xyz"},
+        "target": {"type": "Collection", "id": "group-roomxyz", "name": "group-roomxyz"},
         "isGroupChat": True,
     }
 
@@ -105,7 +105,7 @@ def sample_update_payload():
             "id": "msg-001",
             "content": "Edited message",
         },
-        "target": {"type": "Collection", "id": "room-token-abc", "name": "room-token-abc"},
+        "target": {"type": "Collection", "id": "roomtokenabc", "name": "roomtokenabc"},
     }
 
 
@@ -119,7 +119,7 @@ def sample_delete_payload():
             "type": "Note",
             "id": "msg-001",
         },
-        "target": {"type": "Collection", "id": "room-token-abc", "name": "room-token-abc"},
+        "target": {"type": "Collection", "id": "roomtokenabc", "name": "roomtokenabc"},
     }
 
 
@@ -134,5 +134,5 @@ def sample_empty_content_payload():
             "id": "msg-003",
             "content": "",
         },
-        "target": {"type": "Collection", "id": "room-token-abc", "name": "room-token-abc"},
+        "target": {"type": "Collection", "id": "roomtokenabc", "name": "roomtokenabc"},
     }

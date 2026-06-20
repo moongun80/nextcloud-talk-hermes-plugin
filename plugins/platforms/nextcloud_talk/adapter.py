@@ -44,6 +44,7 @@ import os
 import re
 import secrets
 import time
+import urllib.parse
 from typing import Any, Dict, List, Optional, Set
 
 try:
@@ -303,9 +304,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._http_client = httpx.AsyncClient(
             base_url=self._base_url.rstrip("/"),
             timeout=httpx.Timeout(30.0),
-            headers={
-                "OCS-ApiRequest": "true",
-            },
         )
 
         self._running = True
@@ -628,95 +626,86 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     # ── Outbound: send response ───────────────────────────────────────────
 
     async def send(
-        self,
-        chat_id: str,
-        content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Send a message to Nextcloud Talk via the Bot API."""
-        if not self._http_client or not self._running:
-            return SendResult(success=False, error="Adapter not connected")
+            self,
+            chat_id: str,
+            content: str,
+            reply_to: Optional[str] = None,
+            metadata: Optional[Dict[str, Any]] = None,
+        ) -> SendResult:
+            """Send a message to Nextcloud Talk via the Bot API.
 
-        room_token = chat_id
-        if not room_token:
-            return SendResult(success=False, error="No room_token in chat_id")
+            Per Nextcloud Talk Bot API spec:
+            - URL: POST /api/v1/bot/{token}/message
+            - Headers: x-nextcloud-talk-bot-random, x-nextcloud-talk-bot-signature
+            - Body: form-encoded message=...&replyTo=...
+            - Signature: HMAC-SHA256(secret, random + message_text)
+            """
+            if not self._http_client or not self._running:
+                return SendResult(success=False, error="Adapter not connected")
 
-        # ── m5 FIX: Sanitize room_token for URL path ────────────────────
-        # Only allow safe token characters (alphanumeric, hyphen, underscore)
-        if not re.match(r'^[a-zA-Z0-9\-_]+$', room_token):
-            logger.warning("Unsafe room_token: %r, rejecting", room_token)
-            return SendResult(success=False, error="Invalid room_token")
+            room_token = chat_id
+            if not room_token:
+                return SendResult(success=False, error="No room_token in chat_id")
 
-        url = f"/ocs/v2.php/apps/spreed/api/v1/bot/{room_token}/message"
+            # ── Token validation: per Nextcloud API spec [a-z0-9]{4,30} ──────
+            if not re.match(r'^[a-z0-9]{4,30}$', room_token):
+                logger.warning("Invalid room_token: %r (must be [a-z0-9]{4,30})", room_token)
+                return SendResult(success=False, error="Invalid room_token")
 
-        # ── m9 FIX: Enforce max message length ──────────────────────────
-        if len(content) > self._max_message_length:
-            logger.warning(
-                "Message truncated from %d to %d chars",
-                len(content), self._max_message_length,
-            )
-            content = content[:self._max_message_length]
+            url = f"/api/v1/bot/{room_token}/message"
 
-        payload: Dict[str, Any] = {"message": content}
-        # ── C3 FIX: Convert replyTo to int (spec requires integer) ──────
-        if reply_to:
-            try:
-                payload["replyTo"] = int(reply_to)
-            except (ValueError, TypeError):
-                logger.warning("Invalid reply_to value: %r, sending without reply", reply_to)
-
-        payload_body = json.dumps(payload)
-
-        random_value = secrets.token_hex(16)
-        signing_input = random_value + payload_body
-        signature = hmac.new(
-            self._bot_secret.encode("utf-8"),
-            signing_input.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-
-        try:
-            resp = await self._http_client.post(
-                url,
-                content=payload_body.encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    # ── C2 FIX: Use SEND-specific headers (-Bot- variant) ─
-                    SEND_RANDOM_HEADER: random_value,
-                    SEND_SIGNATURE_HEADER: signature,
-                },
-            )
-            if resp.status_code in (200, 201):
-                # ── M8 FIX: Extract message_id from server response ──────
-                message_id = None
-                try:
-                    resp_data = resp.json()
-                    if isinstance(resp_data, dict):
-                        # Response wrapper: {"ocs":{"data":{"message":12345}}}
-                        ocs = resp_data.get("ocs", {})
-                        if isinstance(ocs, dict):
-                            data = ocs.get("data", {})
-                        else:
-                            data = ocs
-                        if isinstance(data, dict):
-                            message_id = str(data.get("message", ""))
-                        elif isinstance(data, int):
-                            message_id = str(data)
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    pass
-
-                logger.debug(
-                    "Sent message to room %s (reply_to=%s, server_msg_id=%s)",
-                    room_token, reply_to, message_id,
+            # ── Enforce max message length ──────────────────────────────────
+            if len(content) > self._max_message_length:
+                logger.warning(
+                    "Message truncated from %d to %d chars",
+                    len(content), self._max_message_length,
                 )
-                return SendResult(success=True, message_id=message_id)
+                content = content[:self._max_message_length]
 
-            logger.error("Nextcloud Talk send failed: %d %s", resp.status_code, resp.text[:200])
-            return SendResult(success=False, error=f"HTTP {resp.status_code}")
-        except Exception as exc:
-            logger.error("Nextcloud Talk send error: %s", exc)
-            return SendResult(success=False, error=str(exc))
+            # ── Build form-encoded body ─────────────────────────────────────
+            body_parts = [f"message={urllib.parse.quote(content)}"]
+            if reply_to:
+                try:
+                    body_parts.append(f"replyTo={int(reply_to)}")
+                except (ValueError, TypeError):
+                    logger.warning("Invalid reply_to value: %r, sending without reply", reply_to)
+
+            body = "&".join(body_parts)
+
+            # ── Sign: HMAC-SHA256(secret, random + message_text) ────────────
+            # Per BotController::sendMessage(): signature is over random + message
+            # (the plain text message parameter), NOT the JSON body.
+            random_value = secrets.token_hex(16)
+            signing_input = random_value + content
+            signature = hmac.new(
+                self._bot_secret.encode("utf-8"),
+                signing_input.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+
+            try:
+                resp = await self._http_client.post(
+                    url,
+                    content=body.encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        # ── Bot API headers (not OCS) ──────────────────────
+                        SEND_RANDOM_HEADER: random_value,
+                        SEND_SIGNATURE_HEADER: signature,
+                    },
+                )
+                if resp.status_code in (200, 201):
+                    logger.debug(
+                        "Sent message to room %s (reply_to=%s)",
+                        room_token, reply_to,
+                    )
+                    return SendResult(success=True)
+
+                logger.error("Nextcloud Talk send failed: %d %s", resp.status_code, resp.text[:200])
+                return SendResult(success=False, error=f"HTTP {resp.status_code}")
+            except Exception as exc:
+                logger.error("Nextcloud Talk send error: %s", exc)
+                return SendResult(success=False, error=str(exc))
 
     # ── Optional overrides ────────────────────────────────────────────────
 
@@ -846,6 +835,11 @@ async def _standalone_send(
 
     Opens an ephemeral HTTP connection, sends the message, and returns.
     Used by cron jobs that run in a separate process from the gateway.
+
+    Per Nextcloud Talk Bot API spec:
+    - URL: POST /api/v1/bot/{token}/message
+    - Body: form-encoded message=...&replyTo=...
+    - Signature: HMAC-SHA256(secret, random + message_text)
     """
     import httpx as _httpx
 
@@ -862,19 +856,22 @@ async def _standalone_send(
     if not base_url or not bot_secret or not room_token:
         return {"error": "Missing NEXTCLOUD_TALK_BASE_URL, BOT_SECRET, or chat_id"}
 
-    # Sanitize room_token for URL path
-    if not re.match(r'^[a-zA-Z0-9\-_]+$', room_token):
-        return {"error": f"Invalid room_token: {room_token!r}"}
+    # Token validation: per Nextcloud API spec [a-z0-9]{4,30}
+    if not re.match(r'^[a-z0-9]{4,30}$', room_token):
+        return {"error": f"Invalid room_token: {room_token!r} (must be [a-z0-9]{{4,30}})"}
 
     url = (
-        f"{base_url.rstrip('/')}/ocs/v2.php/apps/spreed/api/v1/bot/"
+        f"{base_url.rstrip('/')}/api/v1/bot/"
         f"{room_token}/message"
     )
 
-    payload_body = json.dumps({"message": message})
+    # Build form-encoded body
+    body_parts = [f"message={urllib.parse.quote(message)}"]
+    body = "&".join(body_parts)
 
+    # Sign: HMAC-SHA256(secret, random + message_text)
     random_value = secrets.token_hex(16)
-    signing_input = random_value + payload_body
+    signing_input = random_value + message
     signature = hmac.new(
         bot_secret.encode("utf-8"),
         signing_input.encode("utf-8"),
@@ -885,33 +882,15 @@ async def _standalone_send(
         async with _httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 url,
-                content=payload_body.encode("utf-8"),
+                content=body.encode("utf-8"),
                 headers={
-                    "OCS-ApiRequest": "true",
-                    "Content-Type": "application/json",
-                    # ── C2 FIX: Use SEND-specific headers ────────────
+                    "Content-Type": "application/x-www-form-urlencoded",
                     SEND_RANDOM_HEADER: random_value,
                     SEND_SIGNATURE_HEADER: signature,
                 },
             )
             if resp.status_code in (200, 201):
-                # ── m4 FIX: Extract real message_id from response ────
-                message_id = None
-                try:
-                    resp_data = resp.json()
-                    if isinstance(resp_data, dict):
-                        ocs = resp_data.get("ocs", {})
-                        if isinstance(ocs, dict):
-                            data = ocs.get("data", {})
-                        else:
-                            data = ocs
-                        if isinstance(data, dict):
-                            message_id = str(data.get("message", ""))
-                        elif isinstance(data, int):
-                            message_id = str(data)
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    pass
-                return {"success": True, "message_id": message_id}
+                return {"success": True}
             return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
     except Exception as exc:
         return {"error": str(exc)}

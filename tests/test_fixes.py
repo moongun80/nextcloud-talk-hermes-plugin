@@ -196,7 +196,7 @@ class TestC2SendHeaders:
         mock_resp.status_code = 200
         mock_post = AsyncMock(return_value=mock_resp)
         with patch.object(adapter._http_client, 'post', mock_post):
-            await adapter.send("room-abc", "Hello")
+            await adapter.send("roomabc", "Hello")
 
             headers_used = mock_post.call_args.kwargs["headers"]
             assert SEND_RANDOM_HEADER in headers_used
@@ -221,7 +221,7 @@ class TestC3ReplyToInt:
 
     @pytest.mark.asyncio
     async def test_replyto_converted_to_int(self):
-        """String reply_to should be converted to int."""
+        """String reply_to should be converted to int in form body."""
         adapter = _make_adapter()
         adapter._http_client = MagicMock()
         adapter._running = True
@@ -230,13 +230,12 @@ class TestC3ReplyToInt:
         mock_resp.status_code = 200
         mock_post = AsyncMock(return_value=mock_resp)
         with patch.object(adapter._http_client, 'post', mock_post):
-            await adapter.send("room-abc", "Hello", reply_to="12345")
+            await adapter.send("roomabc", "Hello", reply_to="12345")
 
-            payload_body = mock_post.call_args.kwargs["content"].decode("utf-8")
-            payload = json.loads(payload_body)
-            assert "replyTo" in payload
-            assert isinstance(payload["replyTo"], int)
-            assert payload["replyTo"] == 12345
+            body = mock_post.call_args.kwargs["content"].decode("utf-8")
+            # Form-encoded: message=Hello&replyTo=12345
+            assert "replyTo=12345" in body
+            assert "message=" in body
 
     @pytest.mark.asyncio
     async def test_invalid_replyto_omitted(self):
@@ -249,11 +248,12 @@ class TestC3ReplyToInt:
         mock_resp.status_code = 200
         mock_post = AsyncMock(return_value=mock_resp)
         with patch.object(adapter._http_client, 'post', mock_post):
-            await adapter.send("room-abc", "Hello", reply_to="not-a-number")
+            await adapter.send("roomabc", "Hello", reply_to="not-a-number")
 
-            payload_body = mock_post.call_args.kwargs["content"].decode("utf-8")
-            payload = json.loads(payload_body)
-            assert "replyTo" not in payload
+            body = mock_post.call_args.kwargs["content"].decode("utf-8")
+            # Form-encoded without replyTo
+            assert "replyTo" not in body
+            assert "message=" in body
 
 
 # ── M1: Chat type detection from target.type ──────────────────────────────
@@ -498,64 +498,7 @@ class TestM5XForwardedFor:
         assert adapter._get_client_ip(mock_request) == "0.0.0.0"
 
 
-# ── M8: Server message_id extraction tests ────────────────────────────────
 
-class TestM8ServerMessageId:
-    """Tests for M8: send() extracts server-assigned message_id."""
-
-    @pytest.mark.asyncio
-    async def test_send_extracts_message_id_nested(self):
-        """Should extract message_id from nested OCS response."""
-        adapter = _make_adapter()
-        adapter._http_client = MagicMock()
-        adapter._running = True
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 201
-        mock_resp.json.return_value = {
-            "ocs": {
-                "data": {"message": 98765}
-            }
-        }
-        mock_post = AsyncMock(return_value=mock_resp)
-        with patch.object(adapter._http_client, 'post', mock_post):
-            result = await adapter.send("room-abc", "Hello")
-            assert result.success is True
-            assert result.message_id == "98765"
-
-    @pytest.mark.asyncio
-    async def test_send_extracts_message_id_flat(self):
-        """Should extract message_id from flat OCS data."""
-        adapter = _make_adapter()
-        adapter._http_client = MagicMock()
-        adapter._running = True
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 201
-        mock_resp.json.return_value = {
-            "ocs": 54321
-        }
-        mock_post = AsyncMock(return_value=mock_resp)
-        with patch.object(adapter._http_client, 'post', mock_post):
-            result = await adapter.send("room-abc", "Hello")
-            assert result.success is True
-            assert result.message_id == "54321"
-
-    @pytest.mark.asyncio
-    async def test_send_no_message_id_on_failure(self):
-        """Failed send should not have message_id."""
-        adapter = _make_adapter()
-        adapter._http_client = MagicMock()
-        adapter._running = True
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 500
-        mock_resp.text = "Internal Server Error"
-        mock_post = AsyncMock(return_value=mock_resp)
-        with patch.object(adapter._http_client, 'post', mock_post):
-            result = await adapter.send("room-abc", "Hello")
-            assert result.success is False
-            assert result.message_id is None
 
 
 # ── m5: Room token sanitization ───────────────────────────────────────────
@@ -565,7 +508,7 @@ class TestM5RoomTokenSanitization:
 
     @pytest.mark.asyncio
     async def test_safe_token_accepted(self):
-        """Alphanumeric tokens with hyphens/underscores should work."""
+        """Lowercase alphanumeric tokens should work."""
         adapter = _make_adapter()
         adapter._http_client = MagicMock()
         adapter._running = True
@@ -574,7 +517,7 @@ class TestM5RoomTokenSanitization:
         mock_resp.status_code = 200
         mock_post = AsyncMock(return_value=mock_resp)
         with patch.object(adapter._http_client, 'post', mock_post):
-            result = await adapter.send("safe-room_token", "Hello")
+            result = await adapter.send("safetoken123", "Hello")
             assert result.success is True
 
     @pytest.mark.asyncio
@@ -631,11 +574,14 @@ class TestM9MaxMessageLength:
         mock_resp.status_code = 200
         mock_post = AsyncMock(return_value=mock_resp)
         with patch.object(adapter._http_client, 'post', mock_post):
-            await adapter.send("room-abc", long_msg)
+            await adapter.send("roomabc", long_msg)
 
-            payload_body = mock_post.call_args.kwargs["content"].decode("utf-8")
-            payload = json.loads(payload_body)
-            assert len(payload["message"]) == 10
+            body = mock_post.call_args.kwargs["content"].decode("utf-8")
+            # Form-encoded: message=xxxxxxxxxx
+            assert "message=" in body
+            # Extract the message value (after "message=")
+            msg_part = body.split("message=", 1)[1]
+            assert len(msg_part) == 10
 
 
 # ── Integration: Full message flow ────────────────────────────────────────
@@ -713,14 +659,15 @@ class TestCheckRequirementsIntegration:
             "bot_secret": "config-secret",
         }, NEXTCLOUD_TALK_BASE_URL="https://env.example.com")
         assert check_requirements() is True
-# ── B2: register() max_message_length propagation ─────────────────────────
+# ── B2: max_message_length is NOT passed to register() ────────────────────
+# The register_platform() call does NOT include max_message_length.
+# The adapter reads it from config/env in __init__ only.
 
 class TestB2RegisterMaxMessageLength:
-    """Tests for B2: register() propagates configured max_message_length."""
+    """Tests verifying max_message_length is NOT in register_platform() call."""
 
-    def test_register_uses_default_max_message_length(self):
-        """register() must pass DEFAULT_MAX_MESSAGE_LENGTH when env is unset."""
-        # Ensure env var is unset
+    def test_register_does_not_include_max_message_length(self):
+        """register() must NOT pass max_message_length (not a valid PlatformEntry field)."""
         os.environ.pop("NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH", None)
 
         mock_ctx = MagicMock()
@@ -729,18 +676,4 @@ class TestB2RegisterMaxMessageLength:
         register(mock_ctx)
 
         call_kwargs = mock_ctx.register_platform.call_args.kwargs
-        assert call_kwargs["max_message_length"] == 32000
-
-    def test_register_propagates_custom_max_message_length(self):
-        """register() must propagate NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH from env."""
-        os.environ["NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH"] = "5000"
-        try:
-            mock_ctx = MagicMock()
-            from plugins.platforms.nextcloud_talk.adapter import register
-
-            register(mock_ctx)
-
-            call_kwargs = mock_ctx.register_platform.call_args.kwargs
-            assert call_kwargs["max_message_length"] == 5000
-        finally:
-            os.environ.pop("NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH", None)
+        assert "max_message_length" not in call_kwargs

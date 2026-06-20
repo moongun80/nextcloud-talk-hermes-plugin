@@ -113,7 +113,7 @@ class TestWebhookFullFlow:
                 "content": "Hello integration test!",
                 "mediaType": "text/plain",
             },
-            "target": {"type": "Collection", "id": "room-1", "name": "room-1"},
+            "target": {"type": "Collection", "id": "room1", "name": "room1"},
             "isGroupChat": False,
         }
         random_val, sig, body = _sign(payload, "test-secret")
@@ -139,7 +139,7 @@ class TestWebhookFullFlow:
             "type": "Create",
             "actor": {"type": "Person", "id": "u1", "name": "User One"},
             "object": {"type": "Note", "id": "msg-200", "content": "test"},
-            "target": {"type": "Collection", "id": "room-1", "name": "room-1"},
+            "target": {"type": "Collection", "id": "room1", "name": "room1"},
         }
         random_val, _, body = _sign(payload, "test-secret")
 
@@ -199,7 +199,7 @@ class TestWebhookFullFlow:
                 "content": "Duplicate test",
                 "mediaType": "text/plain",
             },
-            "target": {"type": "Collection", "id": "room-1", "name": "room-1"},
+            "target": {"type": "Collection", "id": "room1", "name": "room1"},
         }
         random_val, sig, body = _sign(payload, "test-secret")
 

@@ -204,7 +204,7 @@ class TestParseMessage:
         assert event is not None
         assert event.text == "Hello from Nextcloud!"
         assert event.source.user_id == "user123"
-        assert event.source.chat_id == "room-token-abc"
+        assert event.source.chat_id == "roomtokenabc"
         assert event.source.chat_type == "dm"
         assert event.message_id == "msg-001"
 
@@ -304,8 +304,8 @@ class TestPermissionPolicies:
 
         source = SessionSource(
             platform=Platform("nextcloud_talk"),
-            chat_id="room-abc",
-            chat_name="room-abc",
+            chat_id="roomabc",
+            chat_name="roomabc",
             chat_type="group",
             user_id="user123",
             user_name="Allowed User",
@@ -321,8 +321,8 @@ class TestPermissionPolicies:
         # Disallowed user
         source2 = SessionSource(
             platform=Platform("nextcloud_talk"),
-            chat_id="room-abc",
-            chat_name="room-abc",
+            chat_id="roomabc",
+            chat_name="roomabc",
             chat_type="group",
             user_id="unknown-user",
             user_name="Unknown User",
@@ -416,8 +416,8 @@ class TestPermissionPolicies:
 
         source = SessionSource(
             platform=Platform("nextcloud_talk"),
-            chat_id="room-xyz",
-            chat_name="room-xyz",
+            chat_id="roomxyz",
+            chat_name="roomxyz",
             chat_type="group",
             user_id="anyone",
             user_name="Anyone",
@@ -489,8 +489,8 @@ class TestReplyToIntConversion:
     """Tests for replyTo integer conversion in send()."""
 
     @pytest.mark.asyncio
-    async def test_replyto_string_converted_to_int(self):
-        """String reply_to should be converted to int in payload."""
+    async def test_replyto_converted_to_int(self):
+        """String reply_to should be converted to int in form body."""
         adapter = _make_adapter()
         adapter._http_client = MagicMock()
         adapter._running = True
@@ -499,16 +499,14 @@ class TestReplyToIntConversion:
         mock_resp.status_code = 200
         mock_post = AsyncMock(return_value=mock_resp)
         with patch.object(adapter._http_client, 'post', mock_post):
-            result = await adapter.send("room-abc", "Hello", reply_to="12345")
+            result = await adapter.send("roomabc", "Hello", reply_to="12345")
             assert result.success is True
 
-            # Verify the payload had replyTo as int
+            # Verify the body is form-encoded with replyTo
             call_kwargs = mock_post.call_args.kwargs
-            payload_body = call_kwargs["content"].decode("utf-8")
-            payload = json.loads(payload_body)
-            assert "replyTo" in payload
-            assert isinstance(payload["replyTo"], int)
-            assert payload["replyTo"] == 12345
+            body = call_kwargs["content"].decode("utf-8")
+            assert "replyTo=12345" in body
+            assert "message=" in body
 
     @pytest.mark.asyncio
     async def test_replyto_invalid_string_logged(self):
@@ -521,16 +519,16 @@ class TestReplyToIntConversion:
         mock_resp.status_code = 200
         mock_post = AsyncMock(return_value=mock_resp)
         with patch.object(adapter._http_client, 'post', mock_post):
-            result = await adapter.send("room-abc", "Hello", reply_to="not-a-number")
+            result = await adapter.send("roomabc", "Hello", reply_to="not-a-number")
             assert result.success is True
 
-            payload_body = mock_post.call_args.kwargs["content"].decode("utf-8")
-            payload = json.loads(payload_body)
-            assert "replyTo" not in payload
+            body = mock_post.call_args.kwargs["content"].decode("utf-8")
+            assert "replyTo" not in body
+            assert "message=" in body
 
     @pytest.mark.asyncio
     async def test_no_replyto_unchanged(self):
-        """No reply_to should not add replyTo to payload."""
+        """No reply_to should not add replyTo to body."""
         adapter = _make_adapter()
         adapter._http_client = MagicMock()
         adapter._running = True
@@ -539,9 +537,9 @@ class TestReplyToIntConversion:
         mock_resp.status_code = 200
         mock_post = AsyncMock(return_value=mock_resp)
         with patch.object(adapter._http_client, 'post', mock_post):
-            result = await adapter.send("room-abc", "Hello")
+            result = await adapter.send("roomabc", "Hello")
             assert result.success is True
 
-            payload_body = mock_post.call_args.kwargs["content"].decode("utf-8")
-            payload = json.loads(payload_body)
-            assert "replyTo" not in payload
+            body = mock_post.call_args.kwargs["content"].decode("utf-8")
+            assert "replyTo" not in body
+            assert "message=" in body
