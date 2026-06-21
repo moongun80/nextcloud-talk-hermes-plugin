@@ -1,128 +1,134 @@
-# Nextcloud Talk Platform Plugin for Hermes Agent
+# Nextcloud Talk Bot Plugin for Hermes Agent
 
-A Hermes Agent platform plugin that connects Nextcloud Talk via webhook. Based on the OpenClaw nextcloud-talk extension pattern.
+Connect your **Nextcloud Talk** bot to **Hermes Agent**.
+This allows your bot to chat with AI.
 
-## Features
+---
 
-- Receive Nextcloud Talk messages via HTTP POST webhook
-- HMAC-SHA256 signature verification (timing attack resistant)
-- ActivityPub-style payload parsing (Create/Update/Delete)
-- Send messages via Bot API (reply-to support)
-- Message deduplication (5 min TTL)
-- `/healthz` health check endpoint
-- Standalone sender for cron jobs
-- **DDoS protection: IP-based Rate Limiting** (30 min block after 10 failures in 5 min)
-- **Room-level permission policies**: group member restriction, DM allow-list
-- **Config validation**: automatic port range and URL format validation
+## 🧠 Theory: How it Works
 
-## Installation
+Imagine two computers talking to each other:
 
-```bash
-pip install aiohttp httpx
+1.  **Computer A (Nextcloud)**: Has the chat rooms and the Bot.
+2.  **Computer B (Hermes)**: Has the AI Brain.
+
+### The Communication Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Nextcloud as Computer A<br/>(Nextcloud Server)
+    participant Hermes as Computer B<br/>(Hermes Server)
+
+    User->>Nextcloud: 1. Types "Hello"
+    Nextcloud->>Hermes: 2. Sends Webhook (HTTP POST)
+    Hermes->>Hermes: 3. AI Thinks...
+    Hermes->>Nextcloud: 4. Sends Reply "Hi!"
+    Nextcloud->>User: 5. Bot posts "Hi!"
 ```
 
-Place in Hermes Agent's `plugins/platforms/` directory:
+**Security**: To prevent hackers from impersonating the bot, they use a **"Secret Password"** (HMAC). Both computers must agree on this password.
+
+---
+
+## 🚀 Quick Start Guide
+
+### Prerequisites
+- A running **Nextcloud** server.
+- A running **Hermes Agent** server.
+- Access to both servers (via SSH/Terminal).
+
+### Step 1: On Nextcloud Server (Generate Credentials)
+
+You need to create a bot and get a **Secret** and a **Webhook URL**.
+
+1.  Log in to your Nextcloud server terminal.
+2.  Run the following command to install the bot:
+
+    ```bash
+    php occ talk:bot:install "Hermes Bot" "MY_SUPER_SECRET" "http://HERMES_SERVER_IP:8745/nextcloud-talk/callback"
+    ```
+
+    > **⚠️ Important Notes:**
+    > - Replace `MY_SUPER_SECRET` with a strong password (you will need this later).
+    > - Replace `HERMES_SERVER_IP` with the **IP address** or **Domain** of your Hermes server (e.g., `192.168.1.100` or `hermes.example.com`).
+    > - Ensure port `8745` is open on the Hermes server firewall.
+
+3.  **Copy the Secret** (`MY_SUPER_SECRET`). You will need it in Step 2.
+
+### Step 2: On Hermes Server (Configure Plugin)
+
+Now tell Hermes how to talk to Nextcloud.
+
+1.  Open your Hermes configuration file (usually located at `~/.hermes/profiles/YOUR_PROFILE/config.yaml`).
+    *   *Example:* `~/.hermes/profiles/trinity/config.yaml`
+2.  Add or update the `nextcloud_talk` section:
+
+    ```yaml
+    gateway:
+      platforms:
+        nextcloud_talk:
+          enabled: true
+          extra:
+            # Your Nextcloud URL (must start with http:// or https://)
+            base_url: "https://cloud.your-domain.com"
+            
+            # The Secret you copied from Step 1
+            bot_secret: "MY_SUPER_SECRET"
+            
+            # Port must match the port in Step 1 (default 8745)
+            port: 8745
+            
+            # Optional: Path (keep default unless you changed it)
+            path: "/nextcloud-talk/callback"
+    ```
+
+3.  Save the file.
+4.  Restart Hermes Agent to apply changes.
+
+---
+
+## ⚙️ Configuration Reference
+
+| Setting | Description | Example |
+|---------|-------------|---------|
+| `base_url` | Your Nextcloud server URL. | `"https://cloud.example.com"` |
+| `bot_secret` | The secret password generated in Step 1. | `"my-secret-password"` |
+| `port` | Port Hermes listens on. Must match Step 1. | `8745` |
+| `path` | URL path for the webhook. | `"/nextcloud-talk/callback"` |
+
+---
+
+## 🛠️ Troubleshooting
+
+### ❌ "403 Forbidden" or "Invalid signature"
+- **Cause**: The `bot_secret` in Hermes does not match the one in Nextcloud.
+- **Fix**: Check your `config.yaml` and ensure the secret is exactly the same (case-sensitive).
+
+### ❌ "Connection Refused"
+- **Cause**: Nextcloud cannot reach Hermes.
+- **Fix**:
+    1. Check if the IP/Domain in Step 1 is correct.
+    2. Check if the Hermes server firewall (UFW/iptables) allows port `8745`.
+    3. Run `curl http://localhost:8745/nextcloud-talk/callback` on the Hermes server to test.
+
+### ❌ "400 Bad Request"
+- **Cause**: Missing headers or invalid JSON.
+- **Fix**: Usually happens if the URL path is wrong. Ensure `path` in config matches the one used in `occ talk:bot:install`.
+
+---
+
+## 📂 Project Structure
 
 ```
-~/.hermes/plugins/platforms/nextcloud_talk/
-├── plugin.yaml
-├── __init__.py
-└── adapter.py
+nextcloud_talk/
+├── plugin.yaml    # Plugin metadata
+├── __init__.py    # Plugin loader
+└── adapter.py     # Core logic (Webhook handler, API client)
 ```
 
-## Configuration (config.yaml)
+---
 
-```yaml
-gateway:
-  platforms:
-    nextcloud_talk:
-      enabled: true
-      extra:
-        base_url: "https://your-nextcloud.example.com"
-        bot_secret: "your-bot-secret"
-        host: "0.0.0.0"
-        port: 8745
-        path: "/nextcloud-talk/callback"
-        # ── Optional: Permission policies ──
-        # group_policy: "all"        # "all" | "members" | "mentioned"
-        # dm_policy: "all"           # "all" | "restricted"
-        # allowed_users: ["user1", "user2"]
-        # allowed_dm_users: ["user1"]
-```
-
-Or via environment variables (config.yaml takes precedence):
-
-```bash
-export NEXTCLOUD_TALK_BASE_URL=https://your-nextcloud.example.com
-export NEXTCLOUD_TALK_BOT_SECRET=your-bot-secret
-export NEXTCLOUD_TALK_PORT=8745
-export NEXTCLOUD_TALK_PATH=/nextcloud-talk/callback
-# ── Optional: Permission policies ──
-export NEXTCLOUD_TALK_ALLOWED_USERS=user1,user2,user3
-export NEXTCLOUD_TALK_GROUP_POLICY=members     # "all" | "members" | "mentioned"
-export NEXTCLOUD_TALK_DM_POLICY=restricted     # "all" | "restricted"
-export NEXTCLOUD_TALK_ALLOWED_DM_USERS=user1,user2
-```
-
-### Permission Policies
-
-| Setting | Options | Description |
-|---------|---------|-------------|
-| `group_policy` | `all` (default) | Allow all messages in group chats |
-| | `members` | Only allow users in `allowed_users` (empty list = deny all) |
-| | `mentioned` | Only allow messages mentioning the bot (future) |
-| `dm_policy` | `all` (default) | Allow all DMs |
-| | `restricted` | Only allow users in `allowed_dm_users` (empty list = deny all) |
-
-## Nextcloud Talk Webhook Setup
-
-1. Open Nextcloud Talk dashboard
-2. Go to **Settings → Bot**
-3. Click **Create Bot**
-4. Set bot name (e.g., "Hermes Agent")
-5. Copy **HMAC Secret** — needed for configuration
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/nextcloud-talk/callback` | Message webhook |
-| GET | `/healthz` | Health check |
-
-## Response Codes
-
-| Code | Description |
-|------|-------------|
-| 200 | Message received/accepted |
-| 400 | Bad request (missing headers, JSON error) |
-| 403 | Signature verification failed |
-| 429 | Rate limit exceeded (10+ failures) |
-| 500 | Internal server error |
-
-## Architecture
-
-```
-Nextcloud Talk ──POST──> [Hermes Plugin] ──> [Agent Processing] ──> Response
-                            │
-                            ├─ HMAC-SHA256 verification
-                            ├─ Rate Limiting (IP-based)
-                            ├─ ActivityPub parsing (Create/Update/Delete)
-                            ├─ Dedup (5min TTL)
-                            ├─ Permission policy check (group/dm)
-                            └─ Bot API send (reply-to support)
-```
-
-## Testing
-
-```bash
-pip install pytest pytest-asyncio
-pytest tests/ -v
-```
-
-See [MANUAL_TEST_GUIDE.md](MANUAL_TEST_GUIDE.md) for detailed test instructions.
-
-See [README_ko.md](README_ko.md) for Korean documentation.
-
-## License
+## 📜 License
 
 MIT
