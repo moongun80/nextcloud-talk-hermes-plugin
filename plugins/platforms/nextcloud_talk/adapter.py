@@ -38,13 +38,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import re
 import secrets
 import time
-import urllib.parse
 from typing import Any, Dict, List, Optional, Set
 
 try:
@@ -103,6 +103,18 @@ RATE_LIMIT_BLOCK_SECONDS = 1800    # 30 minutes block duration
 # Empty set = trust no proxies (use X-Forwarded-For directly).
 # Set to {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} for private networks.
 _DEFAULT_TRUSTED_PROXIES: Set[str] = set()
+
+# ── DoS / memory guards ──────────────────────────────────────────────────
+# Maximum webhook body size. NC Talk messages are tiny; 64 KB is generous.
+MAX_BODY_BYTES: int = 64 * 1024
+
+# Maximum number of IPs tracked for rate limiting.
+# Prevents unbounded growth under distributed attacks.
+MAX_TRACKED_IPS: int = 5_000
+
+# Maximum number of replay nonces stored in memory.
+# Each nonce is ~32 bytes; 10k entries ≈ 320 KB.
+MAX_SEEN_RANDOMS: int = 10_000
 
 
 # ── Plugin helpers ────────────────────────────────────────────────────────
@@ -246,7 +258,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._seen_messages: Dict[str, float] = {}
 
         # ── Room-based permission policies ──────────────────────────────
-        # Use `is None` checks (not `or`) so empty lists are preserved as
+        # Use is None checks (not `or`) so empty lists are preserved as
         # valid values (empty whitelist = deny all).
         allowed_users_raw = extra.get("allowed_users")
         if allowed_users_raw is None:
@@ -286,6 +298,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._site: Optional[web.TCPSite] = None
         self._app: Optional[web.Application] = None
         self._http_client: Optional[httpx.AsyncClient] = None
+
+        # ── Reaction support (send_typing) ──────────────────────────────
+        # Tracks the last received message_id per room for 👀 reaction.
+        # Requires --feature reaction in occ talk:bot:install.
+        self._last_message_ids: Dict[str, str] = {}
 
         # ── Register module-level state for check_requirements ──────────
         _check_requirements_state._has_config = True
@@ -376,57 +393,83 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     # ── Webhook handler ───────────────────────────────────────────────────
 
     async def _handle_webhook(self, request: web.Request) -> web.Response:
-        """Handle incoming Nextcloud Talk webhook POST."""
-        try:
-            body = await request.text()
-            headers = request.headers
+        """Handle incoming Nextcloud Talk webhook POST.
 
-            signature = headers.get(SIGNATURE_HEADER, "")
-            random_val = headers.get(RANDOM_HEADER, "")
+        Security order (must not change):
+        1. Body size guard — reject before reading full body
+        2. Header presence check
+        3. Replay nonce check (read-only — do NOT record yet)
+        4. Signature verification against ALL known secrets
+        5. Record replay nonce (only after signature passes)
+        6. Parse and process JSON body
+        """
+        try:
+            # ── 1. Body size guard ──────────────────────────────────────
+            # Check Content-Length header first (fast path, no body read).
+            # Also enforced after reading to handle chunked transfers.
+            cl = request.headers.get("Content-Length")
+            if cl is not None:
+                try:
+                    if int(cl) > MAX_BODY_BYTES:
+                        logger.warning("Request body too large (%s bytes)", cl)
+                        return _json_response(413, {"error": "Request too large"})
+                except ValueError:
+                    pass
+
+            body_bytes = await request.read()
+            if len(body_bytes) > MAX_BODY_BYTES:
+                logger.warning("Request body too large (%d bytes)", len(body_bytes))
+                return _json_response(413, {"error": "Request too large"})
+
+            try:
+                body = body_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                return _json_response(400, {"error": "Body must be UTF-8"})
+
+            # ── 2. Header presence check ────────────────────────────────
+            signature = request.headers.get(SIGNATURE_HEADER, "")
+            random_val = request.headers.get(RANDOM_HEADER, "")
 
             if not signature or not random_val:
-                logger.warning("Missing signature or random header from Nextcloud")
+                logger.warning("Missing signature or random header")
                 return _json_response(400, {"error": "Missing signature/random headers"})
 
-            # Get real client IP (respecting X-Forwarded-For for proxied setups)
             client_ip = self._get_client_ip(request)
 
-            # ── Replay protection: reject reused random values ────────────
-            if self._is_replayed_random(random_val):
-                logger.warning("Rejected replayed random value from %s", client_ip)
+            # ── 3. Replay check (READ-ONLY — nonce not recorded yet) ────
+            # Must happen before signature check to prevent timing oracle.
+            # Nonce is only recorded in step 5 after signature passes.
+            if self._check_replayed_random(random_val):
+                logger.warning("Rejected replayed nonce from %s", client_ip)
                 return _json_response(400, {"error": "Replayed request"})
 
-            # ── Identify bot from actor.name and verify signature ──────────
-            # Nextcloud sends actor.name in the payload to identify which bot
-            # sent the message. We use this to look up the correct secret.
-            data = json.loads(body)
-            actor = data.get("actor", {})
-            bot_name = str(actor.get("name", "default"))
-            
-            secret = self._bot_secrets.get(bot_name)
-            if not secret:
-                # Fallback to first available secret (legacy single-bot)
-                secret = next(iter(self._bot_secrets.values())) if self._bot_secrets else ""
-            
-            if not secret:
-                logger.warning("No bot secret configured for bot_name=%r", bot_name)
-                return _json_response(403, {"error": "No bot secret configured"})
-            
-            if not self._verify_signature(random_val, body, secret, signature):
+            # ── 4. Signature verification (try ALL known secrets) ───────
+            # Do NOT parse the body or trust any payload content before this.
+            # Iterate all secrets so actor.name (unverified content) cannot
+            # influence which key is used for verification.
+            matched_secret: Optional[str] = None
+            for sec in self._bot_secrets.values():
+                if self._verify_signature(random_val, body, sec, signature):
+                    matched_secret = sec
+                    break
+
+            if not matched_secret:
                 self._record_failed_attempt(client_ip)
                 if self._is_rate_limited(client_ip):
                     logger.warning("Rate limited: %s", client_ip)
                     return _json_response(429, {"error": "Too many failed attempts"})
-                logger.warning("Invalid signature from Nextcloud Talk")
+                logger.warning("Invalid signature from %s", client_ip)
                 return _json_response(403, {"error": "Invalid signature"})
 
+            # ── 5. Signature verified — record nonce, clear IP block ────
+            self._mark_random_seen(random_val)
             self._clear_failed_attempts(client_ip)
 
-            # ── Parse payload ───────────────────────────────────────────
+            # ── 6. Parse and process body (now trusted) ─────────────────
             try:
                 data = json.loads(body)
             except json.JSONDecodeError:
-                logger.error("Received non-JSON webhook body (expected ActivityPub JSON)")
+                logger.error("Non-JSON webhook body after signature pass")
                 return _json_response(400, {"error": "Body must be valid JSON"})
 
             msg_event = self._parse_message(data)
@@ -441,7 +484,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 logger.debug("Skipping duplicate message %s", msg_id)
                 return _json_response(200, {"status": "duplicate"})
 
-            # Delegate to base class for gateway routing
+            # Track last message_id per room for send_typing() reaction
+            if msg_id and msg_event.source:
+                self._last_message_ids[msg_event.source.chat_id] = msg_id
+
             await self.handle_message(msg_event)
             return _json_response(200, {"status": "accepted"})
 
@@ -477,8 +523,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _is_trusted_ip(ip: str, trusted_cidrs: Set[str]) -> bool:
-        """Check if IP is in a trusted CIDR range (simple prefix matching)."""
-        import ipaddress
+        """Check if IP is in a trusted CIDR range."""
         try:
             addr = ipaddress.ip_address(ip)
             for cidr in trusted_cidrs:
@@ -493,14 +538,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     # ── Replay protection ─────────────────────────────────────────────────
 
-    def _is_replayed_random(self, random_val: str) -> bool:
-        """Check if this random value was already seen (replay attack prevention).
-
-        Evicts stale entries on each call for O(1) amortized cost.
-        """
+    def _evict_stale_randoms(self) -> None:
+        """Evict expired nonces. Called before check and record."""
         now = time.monotonic()
-
-        # Evict stale entries
         expired = [
             k for k, ts in self._seen_randoms.items()
             if now - ts > REPLAY_RANDOM_TTL_SECONDS
@@ -508,11 +548,29 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         for k in expired:
             del self._seen_randoms[k]
 
-        if random_val in self._seen_randoms:
-            return True
+    def _check_replayed_random(self, random_val: str) -> bool:
+        """Return True if this nonce was already seen (read-only).
 
-        self._seen_randoms[random_val] = now
-        return False
+        Does NOT record the nonce — call _mark_random_seen() after
+        signature verification passes.
+        """
+        self._evict_stale_randoms()
+        return random_val in self._seen_randoms
+
+    def _mark_random_seen(self, random_val: str) -> None:
+        """Record a nonce as seen (call only after signature verification passes).
+
+        Enforces MAX_SEEN_RANDOMS cap to prevent unbounded memory growth
+        under a flood of valid-signature requests with unique nonces.
+        """
+        if len(self._seen_randoms) >= MAX_SEEN_RANDOMS:
+            # Evict oldest entries to stay under the cap
+            self._evict_stale_randoms()
+            # If still over limit, drop the oldest by insertion order
+            if len(self._seen_randoms) >= MAX_SEEN_RANDOMS:
+                oldest = next(iter(self._seen_randoms))
+                del self._seen_randoms[oldest]
+        self._seen_randoms[random_val] = time.monotonic()
 
     # ── Signature verification ────────────────────────────────────────────
 
@@ -779,8 +837,88 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     # ── Optional overrides ────────────────────────────────────────────────
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        """Nextcloud Talk has no typing indicator."""
-        pass
+        """Show processing indicator via 👀 reaction on the triggering message.
+
+        Nextcloud Talk has no native typing indicator API.
+        Adds a 👀 reaction to the last received message in the chat room.
+
+        Requires the bot to have the 'reaction' feature:
+            occ talk:bot:install ... --feature reaction
+        """
+        if not self._http_client or not self._running or not chat_id:
+            return
+
+        message_id: str = ""
+        if metadata:
+            message_id = str(
+                metadata.get("message_id", "")
+                or metadata.get("reply_to", "")
+                or ""
+            )
+        if not message_id:
+            message_id = self._last_message_ids.get(chat_id, "")
+
+        if message_id:
+            await self.send_reaction(chat_id, message_id, reaction="👀")
+
+    async def send_reaction(
+        self,
+        room_token: str,
+        message_id: str,
+        reaction: str = "👀",
+    ) -> bool:
+        """Add an emoji reaction to a Nextcloud Talk message.
+
+        API: POST /ocs/v2.php/apps/spreed/api/v1/bot/{token}/reaction/{messageId}
+        Body: {"reaction": "👀"}
+        Signed with X-Nextcloud-Talk-Bot-Random / X-Nextcloud-Talk-Bot-Signature.
+
+        Requires --feature reaction in occ talk:bot:install.
+
+        Returns True if the reaction was added successfully, False otherwise.
+        """
+        if not self._http_client or not self._running:
+            return False
+
+        if not re.match(r'^[a-z0-9]{4,30}$', room_token):
+            logger.debug("Invalid room_token for reaction: %r", room_token)
+            return False
+
+        if not message_id:
+            return False
+
+        url = f"/ocs/v2.php/apps/spreed/api/v1/bot/{room_token}/reaction/{message_id}"
+        payload_body = json.dumps({"reaction": reaction})
+        secret = next(iter(self._bot_secrets.values()), "")
+        if not secret:
+            return False
+
+        random_value = secrets.token_hex(32)
+        signature = hmac.new(
+            secret.encode("utf-8"),
+            (random_value + reaction).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        try:
+            resp = await self._http_client.post(
+                url,
+                content=payload_body.encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "OCS-APIRequest": "true",
+                    SEND_RANDOM_HEADER: random_value,
+                    SEND_SIGNATURE_HEADER: signature,
+                },
+            )
+            if resp.status_code in (200, 201):
+                logger.debug("Added %s to message %s in room %s", reaction, message_id, room_token)
+                return True
+            logger.debug("Reaction failed: HTTP %d", resp.status_code)
+            return False
+        except Exception as exc:
+            logger.debug("Reaction error: %s", exc)
+            return False
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return chat info.
@@ -802,7 +940,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     # ── Rate limiting ─────────────────────────────────────────────────────
 
     def _record_failed_attempt(self, ip: str) -> None:
-        """Record a failed authentication attempt for the given IP."""
+        """Record a failed authentication attempt for the given IP.
+
+        Enforces MAX_TRACKED_IPS to prevent unbounded growth under
+        distributed attacks from many different source IPs.
+        """
+        if len(self._failed_attempts) >= MAX_TRACKED_IPS and ip not in self._failed_attempts:
+            # Evict the oldest IP entry to stay under the cap
+            oldest_ip = next(iter(self._failed_attempts))
+            del self._failed_attempts[oldest_ip]
         now = time.monotonic()
         self._failed_attempts.setdefault(ip, []).append(now)
 
