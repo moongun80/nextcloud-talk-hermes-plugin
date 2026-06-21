@@ -1,126 +1,134 @@
-# Hermes Agent 용 Nextcloud Talk 플랫폼 플러그인
+# Hermes Agent 용 Nextcloud Talk Bot 플러그인
 
-Hermes Agent 의 Nextcloud Talk webhook 플랫폼 플러그인. OpenClaw 의 nextcloud-talk extension 패턴을 참고하여 구현.
+**Nextcloud Talk** 봇을 **Hermes Agent** 에 연결하세요.
+봇이 AI 와 대화하도록 연결하는 플러그인입니다.
 
-## 기능
+---
 
-- HTTP POST webhook 으로 Nextcloud Talk 메시지 수신
-- HMAC-SHA256 서명 검증 (Timing attack 방지)
-- ActivityPub 스타일 페이로드 파싱 (Create/Update/Delete 지원)
-- Bot API 를 통한 메시지 발송 (reply-to 지원)
-- 메시지 중복 방지 (5 분 TTL)
-- `/healthz` 헬스체크 엔드포인트
-- Cron jobs 용 standalone sender
-- **DDoS 방어: IP 기반 Rate Limiting** (5 분 내 10 회 실패 시 30 분 차단)
-- **Room 별 권한 정책**: 그룹 채팅 멤버 제한, DM 허용 사용자 제한
-- **설정 검증**: 포트 범위, URL 형식 자동 검증
+## 🧠 이론: 어떻게 작동하나요?
 
-## 설치
+두 컴퓨터가 서로 대화한다고 상상해보세요:
 
-```bash
-pip install aiohttp httpx
+1.  **컴퓨터 A (Nextcloud)**: 채팅방과 봇이 있는 곳
+2.  **컴퓨터 B (Hermes)**: AI 두뇌가 있는 곳
+
+### 통신 흐름
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Nextcloud as 컴퓨터 A<br/>(Nextcloud 서버)
+    participant Hermes as 컴퓨터 B<br/>(Hermes 서버)
+
+    User->>Nextcloud: 1. "안녕" 입력
+    Nextcloud->>Hermes: 2. 웹훅 전송 (HTTP POST)
+    Hermes->>Hermes: 3. AI 생각...
+    Hermes->>Nextcloud: 4. "안녕!" 답변 전송
+    Nextcloud->>User: 5. 봇이 "안녕!" 게시
 ```
 
-Hermes Agent 의 `plugins/platforms/` 디렉토리에 배치:
+**보안**: 해커가 봇을 사칭하지 못하도록 **"비밀 비밀번호"(HMAC)** 를 사용합니다. 두 컴퓨터가 이 비밀번호를 공유해야 합니다.
 
-```
-~/.hermes/plugins/platforms/nextcloud_talk/
-├── plugin.yaml
-├── __init__.py
-└── adapter.py
-```
+---
 
-## 설정 (config.yaml)
+## 🚀 빠른 시작 가이드
 
-```yaml
-gateway:
-  platforms:
-    nextcloud_talk:
-      enabled: true
-      extra:
-        base_url: "https://your-nextcloud.example.com"
-        bot_secret: "your-bot-secret"
-        host: "0.0.0.0"
-        port: 8745
-        path: "/nextcloud-talk/callback"
-        # ── Optional: Permission policies ──
-        # group_policy: "all"        # "all" | "members" | "mentioned"
-        # dm_policy: "all"           # "all" | "restricted"
-        # allowed_users: ["user1", "user2"]
-        # allowed_dm_users: ["user1"]
-```
+### 준비물
+- 실행 중인 **Nextcloud** 서버
+- 실행 중인 **Hermes Agent** 서버
+- 두 서버 모두 접근 가능 (SSH/터미널)
 
-또는 환경변수 (config.yaml 우선):
+### 1 단계: Nextcloud 서버에서 (자격 증명 생성)
 
-```bash
-export NEXTCLOUD_TALK_BASE_URL=https://your-nextcloud.example.com
-export NEXTCLOUD_TALK_BOT_SECRET=your-bot-secret
-export NEXTCLOUD_TALK_PORT=8745
-export NEXTCLOUD_TALK_PATH=/nextcloud-talk/callback
-# ── Optional: Permission policies ──
-export NEXTCLOUD_TALK_ALLOWED_USERS=user1,user2,user3
-export NEXTCLOUD_TALK_GROUP_POLICY=members     # "all" | "members" | "mentioned"
-export NEXTCLOUD_TALK_DM_POLICY=restricted     # "all" | "restricted"
-export NEXTCLOUD_TALK_ALLOWED_DM_USERS=user1,user2
-```
+봇을 만들고 **Secret(비밀번호)** 과 **Webhook URL** 을 받아야 합니다.
 
-### 권한 정책 설명
+1.  Nextcloud 서버 터미널에 로그인하세요.
+2.  다음 명령어를 실행하여 봇을 설치하세요:
 
-| 설정 | 옵션 | 설명 |
+    ```bash
+    php occ talk:bot:install "Hermes Bot" "MY_SUPER_SECRET" "http://HERMES_SERVER_IP:8745/nextcloud-talk/callback"
+    ```
+
+    > **⚠️ 중요:**
+    > - `MY_SUPER_SECRET` 은 강력한 비밀번호로 변경하세요 (나중에 필요합니다).
+    > - `HERMES_SERVER_IP` 는 Hermes 서버의 **IP 주소** 또는 **도메인**으로 변경하세요 (예: `192.168.1.100` 또는 `hermes.example.com`).
+    > - Hermes 서버에서 포트 `8745` 가 열려 있는지 확인하세요.
+
+3.  **Secret 을 복사하세요**. 2 단계에서 필요합니다.
+
+### 2 단계: Hermes 서버에서 (플러그인 설정)
+
+Hermes 가 Nextcloud 와 대화하는 방법을 알려주세요.
+
+1.  Hermes 설정 파일을 엽니다 (일반적으로 `~/.hermes/profiles/YOUR_PROFILE/config.yaml`).
+    *   *예:* `~/.hermes/profiles/trinity/config.yaml`
+2.  `nextcloud_talk` 섹션을 추가하거나 업데이트하세요:
+
+    ```yaml
+    gateway:
+      platforms:
+        nextcloud_talk:
+          enabled: true
+          extra:
+            # Nextcloud URL (http:// 또는 https:// 로 시작해야 함)
+            base_url: "https://cloud.your-domain.com"
+            
+            # 1 단계에서 복사한 Secret
+            bot_secret: "MY_SUPER_SECRET"
+            
+            # 포트는 1 단계와 일치해야 함 (기본 8745)
+            port: 8745
+            
+            # 옵션: 경로 (변경하지 않았다면 기본값 유지)
+            path: "/nextcloud-talk/callback"
+    ```
+
+3.  파일을 저장하세요.
+4.  변경 사항을 적용하기 위해 Hermes Agent 를 재시작하세요.
+
+---
+
+## ⚙️ 설정 참고
+
+| 설정 | 설명 | 예시 |
 |------|------|------|
-| `group_policy` | `all` (기본) | 그룹 채팅의 모든 메시지 허용 |
-| | `members` | `allowed_users` 에 있는 사용자만 허용 (빈 목록 = 전체 차단) |
-| | `mentioned` | 봇이 멘션된 메시지만 허용 (향후 지원) |
-| `dm_policy` | `all` (기본) | 모든 DM 허용 |
-| | `restricted` | `allowed_dm_users` 에 있는 사용자만 허용 (빈 목록 = 전체 차단) |
+| `base_url` | Nextcloud 서버 URL | `"https://cloud.example.com"` |
+| `bot_secret` | 1 단계에서 생성한 비밀번호 | `"my-secret-password"` |
+| `port` | Hermes 가 듣는 포트. 1 단계와 일치해야 함. | `8745` |
+| `path` | 웹훅 URL 경로 | `"/nextcloud-talk/callback"` |
 
-## Nextcloud Talk Webhook 설정
+---
 
-1. Nextcloud Talk 대시보드에서 Bot 설정
-2. Webhook URL: `http://<서버 IP>:8745/nextcloud-talk/callback`
-3. HMAC Secret 발급
+## 🛠️ 문제 해결
 
-## API 엔드포인트
+### ❌ "403 Forbidden" 또는 "Invalid signature"
+- **원인**: Hermes 의 `bot_secret` 가 Nextcloud 의 Secret 과 다름
+- **해결**: `config.yaml` 을 확인하고 비밀번호가 정확히 일치하는지 확인 (대소문자 구분)
 
-| Method | Path | 설명 |
-|--------|------|------|
-| POST | `/nextcloud-talk/callback` | 메시지 webhook |
-| GET | `/healthz` | 헬스체크 |
+### ❌ "Connection Refused"
+- **원인**: Nextcloud 가 Hermes 에 도달하지 못함
+- **해결**:
+    1. 1 단계의 IP/도메인이 올바른지 확인
+    2. Hermes 서버 방화벽 (UFW/iptables) 이 포트 `8745` 를 허용하는지 확인
+    3. Hermes 서버에서 `curl http://localhost:8745/nextcloud-talk/callback` 테스트
 
-## 응답 코드
+### ❌ "400 Bad Request"
+- **원인**: 헤더 누락 또는 잘못된 JSON
+- **해결**: 일반적으로 경로가 잘못되었을 때 발생. 설정의 `path` 가 `occ talk:bot:install` 에서 사용한 것과 일치하는지 확인
 
-| 코드 | 설명 |
-|------|------|
-| 200 | 메시지 수신/수락됨 |
-| 400 | 잘못된 요청 (헤더 누락, JSON 오류) |
-| 403 | 서명 검증 실패 |
-| 429 | Rate limit 초과 (10 회 이상 실패) |
-| 500 | 내부 서버 오류 |
+---
 
-## 아키텍처
+## 📂 프로젝트 구조
 
 ```
-Nextcloud Talk ──POST──> [Hermes Plugin] ──> [Agent Processing] ──> Response
-                            │
-                            ├─ HMAC-SHA256 검증
-                            ├─ Rate Limiting (IP 기반)
-                            ├─ ActivityPub 파싱 (Create/Update/Delete)
-                            ├─ Dedup (5min TTL)
-                            ├─ 권한 정책 체크 (group/dm)
-                            └─ Bot API 발송 (reply-to 지원)
+nextcloud_talk/
+├── plugin.yaml    # 플러그인 정보
+├── __init__.py    # 플러그인 로더
+└── adapter.py     # 핵심 로직 (웹훅 핸들러, API 클라이언트)
 ```
 
-## 테스트
+---
 
-```bash
-pip install pytest pytest-asyncio
-pytest tests/ -v
-```
-
-자세한 테스트 가이드는 [MANUAL_TEST_GUIDE.md](MANUAL_TEST_GUIDE.md) 참조.
-
-See [README.md](README.md) for English documentation.
-
-## 라이선스
+## 📜 라이선스
 
 MIT
