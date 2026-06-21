@@ -481,7 +481,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     ) -> bool:
         """Verify HMAC-SHA256 signature.
 
-        Signature = HMAC-SHA256(random + body, secret)
+        Signature = HMAC-SHA256(random + raw_body, secret)
         Uses constant-time comparison to prevent timing attacks.
         """
         computed = hmac.new(
@@ -635,9 +635,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             """Send a message to Nextcloud Talk via the Bot API.
 
             Per Nextcloud Talk Bot API spec:
-            - URL: POST /api/v1/bot/{token}/message
+            - URL: POST /ocs/v2.php/apps/spreed/api/v1/bot/{token}/message
+            - Content-Type: application/json
+            - Body: {"message": "...", "replyTo": ...}
+            - Header: OCS-APIRequest: true
             - Headers: x-nextcloud-talk-bot-random, x-nextcloud-talk-bot-signature
-            - Body: form-encoded message=...&replyTo=...
             - Signature: HMAC-SHA256(secret, random + message_text)
             """
             if not self._http_client or not self._running:
@@ -652,31 +654,38 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 logger.warning("Invalid room_token: %r (must be [a-z0-9]{4,30})", room_token)
                 return SendResult(success=False, error="Invalid room_token")
 
-            url = f"/api/v1/bot/{room_token}/message"
+            url = f"/ocs/v2.php/apps/spreed/api/v1/bot/{room_token}/message"
+
+            # ── Guard: reject empty content early (avoids 400 from server) ──
+            stripped = content.strip()
+            if not stripped:
+                logger.warning("Refusing to send empty message to room %s", room_token)
+                return SendResult(success=False, error="Empty message content")
 
             # ── Enforce max message length ──────────────────────────────────
-            if len(content) > self._max_message_length:
+            if len(stripped) > self._max_message_length:
                 logger.warning(
                     "Message truncated from %d to %d chars",
-                    len(content), self._max_message_length,
+                    len(stripped), self._max_message_length,
                 )
-                content = content[:self._max_message_length]
+                stripped = stripped[:self._max_message_length]
 
-            # ── Build form-encoded body ─────────────────────────────────────
-            body_parts = [f"message={urllib.parse.quote(content)}"]
+            # ── Build JSON body ─────────────────────────────────────────────
+            payload: Dict[str, Any] = {"message": stripped}
             if reply_to:
                 try:
-                    body_parts.append(f"replyTo={int(reply_to)}")
+                    payload["replyTo"] = int(reply_to)
                 except (ValueError, TypeError):
                     logger.warning("Invalid reply_to value: %r, sending without reply", reply_to)
 
-            body = "&".join(body_parts)
+            body = json.dumps(payload)
 
             # ── Sign: HMAC-SHA256(secret, random + message_text) ────────────
             # Per BotController::sendMessage(): signature is over random + message
             # (the plain text message parameter), NOT the JSON body.
-            random_value = secrets.token_hex(16)
-            signing_input = random_value + content
+            # Use 64-char random (token_hex(32)) for stronger replay protection.
+            random_value = secrets.token_hex(32)
+            signing_input = random_value + stripped
             signature = hmac.new(
                 self._bot_secret.encode("utf-8"),
                 signing_input.encode("utf-8"),
@@ -688,8 +697,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     url,
                     content=body.encode("utf-8"),
                     headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        # ── Bot API headers (not OCS) ──────────────────────
+                        "Content-Type": "application/json",
+                        "OCS-APIRequest": "true",
+                        # ── Bot API headers ────────────────────────────────
                         SEND_RANDOM_HEADER: random_value,
                         SEND_SIGNATURE_HEADER: signature,
                     },
@@ -837,8 +847,10 @@ async def _standalone_send(
     Used by cron jobs that run in a separate process from the gateway.
 
     Per Nextcloud Talk Bot API spec:
-    - URL: POST /api/v1/bot/{token}/message
-    - Body: form-encoded message=...&replyTo=...
+    - URL: POST /ocs/v2.php/apps/spreed/api/v1/bot/{token}/message
+    - Content-Type: application/json
+    - Body: {"message": "...", "replyTo": ...}
+    - Header: OCS-APIRequest: true
     - Signature: HMAC-SHA256(secret, random + message_text)
     """
     import httpx as _httpx
@@ -861,17 +873,22 @@ async def _standalone_send(
         return {"error": f"Invalid room_token: {room_token!r} (must be [a-z0-9]{{4,30}})"}
 
     url = (
-        f"{base_url.rstrip('/')}/api/v1/bot/"
+        f"{base_url.rstrip('/')}/ocs/v2.php/apps/spreed/api/v1/bot/"
         f"{room_token}/message"
     )
 
-    # Build form-encoded body
-    body_parts = [f"message={urllib.parse.quote(message)}"]
-    body = "&".join(body_parts)
+    # Build JSON body
+    stripped_msg = message.strip()
+    if not stripped_msg:
+        return {"error": "Empty message content"}
+
+    payload = {"message": stripped_msg}
+    body = json.dumps(payload)
 
     # Sign: HMAC-SHA256(secret, random + message_text)
-    random_value = secrets.token_hex(16)
-    signing_input = random_value + message
+    # Use 64-char random (token_hex(32)) for stronger replay protection.
+    random_value = secrets.token_hex(32)
+    signing_input = random_value + stripped_msg
     signature = hmac.new(
         bot_secret.encode("utf-8"),
         signing_input.encode("utf-8"),
@@ -884,7 +901,8 @@ async def _standalone_send(
                 url,
                 content=body.encode("utf-8"),
                 headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Type": "application/json",
+                    "OCS-APIRequest": "true",
                     SEND_RANDOM_HEADER: random_value,
                     SEND_SIGNATURE_HEADER: signature,
                 },

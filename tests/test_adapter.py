@@ -6,6 +6,8 @@ import os
 import sys
 import time
 import json
+import hashlib
+import hmac
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -109,6 +111,70 @@ class TestVerifySignature:
         assert adapter._verify_signature(
             random_val, body, secret, sig_upper
         ) is True
+
+    def test_json_body_extracts_message_for_signature(self):
+        """JSON webhook body: signature is over raw body, not extracted message.
+
+        Per spec, the server signs HMAC(secret, RANDOM + raw_request_body).
+        The _verify_signature method must accept a signature computed over
+        the full raw JSON body, not over extracted message text.
+        """
+        adapter = _make_adapter()
+        random_val = "abc123"
+        secret = "mysecret"
+        import hashlib, hmac
+
+        # Simulate a real Nextcloud webhook JSON body
+        json_body = json.dumps({
+            "type": "Create",
+            "actor": {"type": "Person", "id": "user1", "name": "Alice"},
+            "object": {
+                "type": "Note",
+                "id": "msg-001",
+                "content": json.dumps({"message": "Hello from bot!"}),
+                "mediaType": "text/plain",
+            },
+            "target": {"type": "Collection", "id": "roomabc", "name": "General"},
+        })
+
+        # The server signs: HMAC(secret, random + raw_json_body)
+        expected_sig = hmac.new(
+            secret.encode(),
+            (random_val + json_body).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        assert adapter._verify_signature(random_val, json_body, secret, expected_sig) is True
+
+        # Wrong signature (using extracted message text) should fail
+        wrong_sig = hmac.new(
+            secret.encode(),
+            (random_val + "Hello from bot!").encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        assert adapter._verify_signature(random_val, json_body, secret, wrong_sig) is False
+
+    def test_json_body_with_plain_text_content(self):
+        """JSON body with plain-text (non-JSON) content field: sig over raw body."""
+        adapter = _make_adapter()
+        random_val = "xyz789"
+        secret = "testsecret"
+        import hashlib, hmac
+
+        json_body = json.dumps({
+            "type": "Create",
+            "object": {
+                "type": "Note",
+                "content": "Plain text message",
+            },
+        })
+
+        # Signature is over the full raw JSON body
+        expected_sig = hmac.new(
+            secret.encode(),
+            (random_val + json_body).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        assert adapter._verify_signature(random_val, json_body, secret, expected_sig) is True
 
 
 # ── _is_duplicate() tests ────────────────────────────────────────────────
@@ -490,7 +556,7 @@ class TestReplyToIntConversion:
 
     @pytest.mark.asyncio
     async def test_replyto_converted_to_int(self):
-        """String reply_to should be converted to int in form body."""
+        """String reply_to should be converted to int in JSON body."""
         adapter = _make_adapter()
         adapter._http_client = MagicMock()
         adapter._running = True
@@ -502,11 +568,12 @@ class TestReplyToIntConversion:
             result = await adapter.send("roomabc", "Hello", reply_to="12345")
             assert result.success is True
 
-            # Verify the body is form-encoded with replyTo
+            # Verify the body is JSON with replyTo
             call_kwargs = mock_post.call_args.kwargs
             body = call_kwargs["content"].decode("utf-8")
-            assert "replyTo=12345" in body
-            assert "message=" in body
+            body_obj = json.loads(body)
+            assert body_obj["message"] == "Hello"
+            assert body_obj["replyTo"] == 12345
 
     @pytest.mark.asyncio
     async def test_replyto_invalid_string_logged(self):
@@ -522,13 +589,15 @@ class TestReplyToIntConversion:
             result = await adapter.send("roomabc", "Hello", reply_to="not-a-number")
             assert result.success is True
 
-            body = mock_post.call_args.kwargs["content"].decode("utf-8")
-            assert "replyTo" not in body
-            assert "message=" in body
+            call_kwargs = mock_post.call_args.kwargs
+            body = call_kwargs["content"].decode("utf-8")
+            body_obj = json.loads(body)
+            assert body_obj["message"] == "Hello"
+            assert "replyTo" not in body_obj
 
     @pytest.mark.asyncio
     async def test_no_replyto_unchanged(self):
-        """No reply_to should not add replyTo to body."""
+        """No reply_to should not add replyTo to JSON body."""
         adapter = _make_adapter()
         adapter._http_client = MagicMock()
         adapter._running = True
@@ -541,5 +610,109 @@ class TestReplyToIntConversion:
             assert result.success is True
 
             body = mock_post.call_args.kwargs["content"].decode("utf-8")
-            assert "replyTo" not in body
-            assert "message=" in body
+            body_obj = json.loads(body)
+            assert body_obj["message"] == "Hello"
+            assert "replyTo" not in body_obj
+
+
+# ── B4: Spec-true tests for OCS endpoint, OCS-APIRequest, JSON body, raw-body sig ──
+
+class TestSpecTrueSendEndpoint:
+    """Tests asserting the real Nextcloud Talk Bot API spec for send()."""
+
+    @pytest.mark.asyncio
+    async def test_send_uses_ocs_endpoint(self):
+        """send() must POST to /ocs/v2.php/apps/spreed/api/v1/bot/{token}/message."""
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._running = True
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_post = AsyncMock(return_value=mock_resp)
+        with patch.object(adapter._http_client, 'post', mock_post):
+            await adapter.send("roomabc", "Hello")
+
+            # url is the first positional argument
+            url = mock_post.call_args.args[0]
+            assert url == "/ocs/v2.php/apps/spreed/api/v1/bot/roomabc/message"
+
+    @pytest.mark.asyncio
+    async def test_send_uses_json_content_type(self):
+        """send() must use Content-Type: application/json."""
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._running = True
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_post = AsyncMock(return_value=mock_resp)
+        with patch.object(adapter._http_client, 'post', mock_post):
+            await adapter.send("roomabc", "Hello")
+
+            call_kwargs = mock_post.call_args.kwargs
+            headers = call_kwargs["headers"]
+            assert headers["Content-Type"] == "application/json"
+
+    @pytest.mark.asyncio
+    async def test_send_ocs_apirequest_header_present(self):
+        """send() must include OCS-APIRequest: true header."""
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._running = True
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_post = AsyncMock(return_value=mock_resp)
+        with patch.object(adapter._http_client, 'post', mock_post):
+            await adapter.send("roomabc", "Hello")
+
+            call_kwargs = mock_post.call_args.kwargs
+            headers = call_kwargs["headers"]
+            assert headers["OCS-APIRequest"] == "true"
+
+    @pytest.mark.asyncio
+    async def test_send_json_body_structure(self):
+        """send() body must be JSON {\"message\": \"...\"}."""
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._running = True
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_post = AsyncMock(return_value=mock_resp)
+        with patch.object(adapter._http_client, 'post', mock_post):
+            await adapter.send("roomabc", "Test message")
+
+            call_kwargs = mock_post.call_args.kwargs
+            body = call_kwargs["content"].decode("utf-8")
+            body_obj = json.loads(body)
+            assert body_obj == {"message": "Test message"}
+
+
+class TestSpecTrueReceiveSignature:
+    """Tests asserting receive _verify_signature uses raw body."""
+
+    def test_verify_accepts_raw_body_signature(self):
+        """_verify_signature must accept a signature over random + raw body."""
+        adapter = _make_adapter()
+        random_val = "test-random"
+        body = '{"type":"Create","object":{"content":"hi"}}'
+        secret = "secret"
+        import hashlib, hmac
+        expected_sig = hmac.new(
+            secret.encode(), (random_val + body).encode(), hashlib.sha256
+        ).hexdigest()
+        assert adapter._verify_signature(random_val, body, secret, expected_sig) is True
+
+    def test_verify_rejects_message_text_signature(self):
+        """_verify_signature must reject a signature over extracted message text."""
+        adapter = _make_adapter()
+        random_val = "test-random"
+        body = '{"type":"Create","object":{"content":"hello world"}}'
+        secret = "secret"
+        # Signature over extracted message text (not raw body)
+        wrong_sig = hmac.new(
+            secret.encode(), (random_val + "hello world").encode(), hashlib.sha256
+        ).hexdigest()
+        assert adapter._verify_signature(random_val, body, secret, wrong_sig) is False

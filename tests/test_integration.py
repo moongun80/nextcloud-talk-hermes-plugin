@@ -42,10 +42,14 @@ except ImportError:
 
 
 def _sign(payload: dict, secret: str):
-    """Generate random + signature for a payload."""
+    """Generate random + signature for a payload.
+
+    Signature is over random + raw body (matching _verify_signature spec).
+    """
     import secrets
-    random_val = secrets.token_hex(16)
+    random_val = secrets.token_hex(32)  # 64-char random
     body = json.dumps(payload)
+
     sig = hmac.new(
         secret.encode("utf-8"),
         (random_val + body).encode("utf-8"),
@@ -219,12 +223,7 @@ class TestWebhookFullFlow:
 
             # Second request with same message but DIFFERENT random value
             # (tests message_id dedup, not replay protection)
-            random_val2 = secrets.token_hex(16)
-            sig2 = hmac.new(
-                b"test-secret",
-                (random_val2 + body).encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
+            random_val2, sig2, _ = _sign(payload, "test-secret")
             resp2 = await client.post(
                 adapter._path,
                 data=body,
@@ -327,7 +326,11 @@ class TestNonJsonBody:
 
     @pytest.mark.asyncio
     async def test_empty_non_json_body_rejected(self, adapter):
-        """Empty non-JSON body should be rejected with 400."""
+        """Empty non-JSON body: signature passes (raw body), then JSON parse fails (400).
+
+        With raw-body signature verification, a signature over the raw body
+        will pass. Then JSON parsing fails and returns 400.
+        """
         app = _build_app(adapter)
         async with TestClient(TestServer(app)) as client:
             body = "   "
@@ -346,4 +349,7 @@ class TestNonJsonBody:
                     RANDOM_HEADER: random_val,
                 },
             )
+            # Signature passes (raw body), then JSON parsing fails
             assert resp.status == 400
+            data = await resp.json()
+            assert "valid JSON" in data["error"]

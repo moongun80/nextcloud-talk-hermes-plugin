@@ -221,7 +221,7 @@ class TestC3ReplyToInt:
 
     @pytest.mark.asyncio
     async def test_replyto_converted_to_int(self):
-        """String reply_to should be converted to int in form body."""
+        """String reply_to should be converted to int in JSON body."""
         adapter = _make_adapter()
         adapter._http_client = MagicMock()
         adapter._running = True
@@ -233,9 +233,9 @@ class TestC3ReplyToInt:
             await adapter.send("roomabc", "Hello", reply_to="12345")
 
             body = mock_post.call_args.kwargs["content"].decode("utf-8")
-            # Form-encoded: message=Hello&replyTo=12345
-            assert "replyTo=12345" in body
-            assert "message=" in body
+            body_obj = json.loads(body)
+            assert body_obj["message"] == "Hello"
+            assert body_obj["replyTo"] == 12345
 
     @pytest.mark.asyncio
     async def test_invalid_replyto_omitted(self):
@@ -251,9 +251,9 @@ class TestC3ReplyToInt:
             await adapter.send("roomabc", "Hello", reply_to="not-a-number")
 
             body = mock_post.call_args.kwargs["content"].decode("utf-8")
-            # Form-encoded without replyTo
-            assert "replyTo" not in body
-            assert "message=" in body
+            body_obj = json.loads(body)
+            assert body_obj["message"] == "Hello"
+            assert "replyTo" not in body_obj
 
 
 # ── M1: Chat type detection from target.type ──────────────────────────────
@@ -577,11 +577,10 @@ class TestM9MaxMessageLength:
             await adapter.send("roomabc", long_msg)
 
             body = mock_post.call_args.kwargs["content"].decode("utf-8")
-            # Form-encoded: message=xxxxxxxxxx
-            assert "message=" in body
-            # Extract the message value (after "message=")
-            msg_part = body.split("message=", 1)[1]
-            assert len(msg_part) == 10
+            body_obj = json.loads(body)
+            # JSON body with truncated message
+            assert body_obj["message"] == "x" * 10
+            assert len(body_obj["message"]) == 10
 
 
 # ── Integration: Full message flow ────────────────────────────────────────
