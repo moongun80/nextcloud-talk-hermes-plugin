@@ -117,17 +117,18 @@ def check_requirements() -> bool:
 
     # Module-level state set by __init__ (covers config.yaml-only setup)
     if getattr(_check_requirements_state, "_has_config", False):
-        if not getattr(_check_requirements_state, "_has_secret", False):
-            logger.debug("Nextcloud Talk: bot_secret not in config")
+        if not getattr(_check_requirements_state, "_has_secrets", False):
+            logger.debug("Nextcloud Talk: bot_secrets not in config")
             return False
         if not getattr(_check_requirements_state, "_has_base_url", False):
             logger.debug("Nextcloud Talk: base_url not in config")
             return False
     else:
         # Fallback: check env vars
-        secret = os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
+        bot_secret = os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
+        bot_secrets_json = os.getenv("NEXTCLOUD_TALK_BOT_SECRETS", "")
         base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
-        if not secret or not base_url:
+        if not (bot_secret or bot_secrets_json) or not base_url:
             logger.debug("Nextcloud Talk: required env vars not set")
             return False
 
@@ -148,14 +149,14 @@ def check_requirements() -> bool:
 # Module-level state container for check_requirements (bridge config.yaml gap)
 class _check_requirements_state:
     _has_config = False
-    _has_secret = False
+    _has_secrets = False
     _has_base_url = False
 
     @classmethod
     def reset(cls):
         """Reset state for test isolation."""
         cls._has_config = False
-        cls._has_secret = False
+        cls._has_secrets = False
         cls._has_base_url = False
 
 
@@ -164,7 +165,8 @@ def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     base_url = extra.get("base_url", "") or os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
     bot_secret = extra.get("bot_secret", "") or os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
-    return bool(base_url and bot_secret)
+    bot_secrets = extra.get("bot_secrets") or os.getenv("NEXTCLOUD_TALK_BOT_SECRETS", "")
+    return bool(base_url and (bot_secret or bot_secrets))
 
 
 # ── Adapter ───────────────────────────────────────────────────────────────
@@ -197,9 +199,32 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._base_url = str(
             extra.get("base_url", "") or os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
         )
-        self._bot_secret = str(
-            extra.get("bot_secret", "") or os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
-        )
+        # ── Multi-bot support: map bot_name → secret ─────────────────────
+        # Supports both legacy single-bot config and multi-bot dict config.
+        # Legacy: bot_secret: "single-secret"
+        # Multi-bot: bot_secrets: { "Bot1": "secret1", "Bot2": "secret2" }
+        self._bot_secrets: Dict[str, str] = {}
+
+        raw_secrets = extra.get("bot_secrets")
+        if raw_secrets is None:
+            raw_secrets = os.getenv("NEXTCLOUD_TALK_BOT_SECRETS")
+        
+        if isinstance(raw_secrets, dict):
+            # Multi-bot config: {"Bot1": "secret1", "Bot2": "secret2"}
+            self._bot_secrets = {str(k): str(v) for k, v in raw_secrets.items()}
+        elif isinstance(raw_secrets, str) and raw_secrets:
+            # JSON string: '{"Bot1": "secret1", "Bot2": "secret2"}'
+            try:
+                parsed = json.loads(raw_secrets)
+                if isinstance(parsed, dict):
+                    self._bot_secrets = {str(k): str(v) for k, v in parsed.items()}
+            except (json.JSONDecodeError, TypeError):
+                pass
+        
+        # Legacy fallback: single bot_secret → key="default"
+        legacy_secret = extra.get("bot_secret") or os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
+        if legacy_secret and not self._bot_secrets:
+            self._bot_secrets["default"] = str(legacy_secret)
 
         # Max message length (prevent 413 errors from oversized payloads)
         self._max_message_length: int = int(
@@ -264,7 +289,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         # ── Register module-level state for check_requirements ──────────
         _check_requirements_state._has_config = True
-        _check_requirements_state._has_secret = bool(self._bot_secret)
+        _check_requirements_state._has_secrets = bool(self._bot_secrets)
         _check_requirements_state._has_base_url = bool(self._base_url)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
@@ -275,9 +300,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             logger.error("nextcloud_talk requires aiohttp and httpx")
             return False
 
-        if not self._base_url or not self._bot_secret:
+        if not self._base_url or not self._bot_secrets:
             logger.error(
-                "nextcloud_talk requires base_url and bot_secret",
+                "nextcloud_talk requires base_url and bot_secrets",
             )
             return False
 
@@ -371,7 +396,23 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 logger.warning("Rejected replayed random value from %s", client_ip)
                 return _json_response(400, {"error": "Replayed request"})
 
-            if not self._verify_signature(random_val, body, self._bot_secret, signature):
+            # ── Identify bot from actor.name and verify signature ──────────
+            # Nextcloud sends actor.name in the payload to identify which bot
+            # sent the message. We use this to look up the correct secret.
+            data = json.loads(body)
+            actor = data.get("actor", {})
+            bot_name = str(actor.get("name", "default"))
+            
+            secret = self._bot_secrets.get(bot_name)
+            if not secret:
+                # Fallback to first available secret (legacy single-bot)
+                secret = next(iter(self._bot_secrets.values())) if self._bot_secrets else ""
+            
+            if not secret:
+                logger.warning("No bot secret configured for bot_name=%r", bot_name)
+                return _json_response(403, {"error": "No bot secret configured"})
+            
+            if not self._verify_signature(random_val, body, secret, signature):
                 self._record_failed_attempt(client_ip)
                 if self._is_rate_limited(client_ip):
                     logger.warning("Rate limited: %s", client_ip)
@@ -631,6 +672,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             content: str,
             reply_to: Optional[str] = None,
             metadata: Optional[Dict[str, Any]] = None,
+            bot_name: Optional[str] = None,
         ) -> SendResult:
             """Send a message to Nextcloud Talk via the Bot API.
 
@@ -641,6 +683,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             - Header: OCS-APIRequest: true
             - Headers: x-nextcloud-talk-bot-random, x-nextcloud-talk-bot-signature
             - Signature: HMAC-SHA256(secret, random + message_text)
+            
+            Args:
+                chat_id: Room token to send to
+                content: Message text
+                reply_to: Optional message ID to reply to
+                metadata: Optional metadata dict
+                bot_name: Optional bot name for multi-bot support.
+                         If None, uses the first configured bot's secret.
             """
             if not self._http_client or not self._running:
                 return SendResult(success=False, error="Adapter not connected")
@@ -680,6 +730,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
             body = json.dumps(payload)
 
+            # ── Select bot secret ─────────────────────────────────────────
+            # Use bot_name if provided, otherwise fall back to first available.
+            effective_bot = bot_name or "default"
+            secret = self._bot_secrets.get(effective_bot)
+            if not secret:
+                secret = next(iter(self._bot_secrets.values())) if self._bot_secrets else ""
+            if not secret:
+                return SendResult(success=False, error="No bot secret configured")
+
             # ── Sign: HMAC-SHA256(secret, random + message_text) ────────────
             # Per BotController::sendMessage(): signature is over random + message
             # (the plain text message parameter), NOT the JSON body.
@@ -687,7 +746,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             random_value = secrets.token_hex(32)
             signing_input = random_value + stripped
             signature = hmac.new(
-                self._bot_secret.encode("utf-8"),
+                secret.encode("utf-8"),
                 signing_input.encode("utf-8"),
                 hashlib.sha256,
             ).hexdigest()
@@ -839,7 +898,7 @@ def _json_response(status: int, body: Dict[str, Any]) -> Any:
 # ── Standalone sender (cron out-of-process) ──────────────────────────────
 
 async def _standalone_send(
-    pconfig, chat_id, message, *, thread_id=None, **kwargs
+    pconfig, chat_id, message, *, thread_id=None, bot_name=None, **kwargs
 ):
     """Send a message via Nextcloud Talk without a live gateway adapter.
 
@@ -852,6 +911,14 @@ async def _standalone_send(
     - Body: {"message": "...", "replyTo": ...}
     - Header: OCS-APIRequest: true
     - Signature: HMAC-SHA256(secret, random + message_text)
+    
+    Args:
+        pconfig: Platform config
+        chat_id: Room token to send to
+        message: Message text
+        thread_id: Optional thread ID
+        bot_name: Optional bot name for multi-bot support.
+                 If None, uses the first configured bot's secret.
     """
     import httpx as _httpx
 
@@ -859,10 +926,28 @@ async def _standalone_send(
         pconfig.extra.get("base_url", "")
         or os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
     )
-    bot_secret = (
-        pconfig.extra.get("bot_secret", "")
-        or os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
-    )
+    
+    # ── Multi-bot support: resolve bot secret ───────────────────────
+    bot_secrets = pconfig.extra.get("bot_secrets")
+    if not bot_secrets:
+        bot_secrets_str = os.getenv("NEXTCLOUD_TALK_BOT_SECRETS")
+        if bot_secrets_str:
+            try:
+                bot_secrets = json.loads(bot_secrets_str)
+            except (json.JSONDecodeError, TypeError):
+                bot_secrets = None
+    
+    bot_secret = ""
+    if bot_secrets and isinstance(bot_secrets, dict):
+        bot_secret = bot_secrets.get(bot_name or "default", "")
+        if not bot_secret:
+            bot_secret = next(iter(bot_secrets.values()), "")
+    elif bot_name:
+        # Legacy: single bot_secret with bot_name
+        bot_secret = pconfig.extra.get("bot_secret", "") or os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
+    else:
+        bot_secret = pconfig.extra.get("bot_secret", "") or os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
+    
     room_token = chat_id
 
     if not base_url or not bot_secret or not room_token:
@@ -922,8 +1007,20 @@ def register(ctx) -> None:
     def _env_enablement() -> dict | None:
         base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL", "")
         bot_secret = os.getenv("NEXTCLOUD_TALK_BOT_SECRET", "")
-        if base_url and bot_secret:
-            return {"extra": {"base_url": base_url, "bot_secret": bot_secret}}
+        bot_secrets_json = os.getenv("NEXTCLOUD_TALK_BOT_SECRETS", "")
+        
+        extra = {"base_url": base_url}
+        
+        if bot_secrets_json:
+            try:
+                extra["bot_secrets"] = json.loads(bot_secrets_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        elif bot_secret:
+            extra["bot_secret"] = bot_secret
+        
+        if base_url and (bot_secret or bot_secrets_json):
+            return {"extra": extra}
         return None
 
     ctx.register_platform(
